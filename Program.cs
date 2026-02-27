@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration;
 using System.Diagnostics;
 using Microsoft.Data.SqlClient;
 using Dapper;
@@ -48,6 +48,8 @@ namespace Logistics.DbMerger
                 Console.WriteLine("4. Validate / Verify");
                 Console.WriteLine("5. Rollback Last Action");
                 Console.WriteLine("6. Exit");
+                Console.WriteLine("7. List tables only in MDC (console + file) and create structure in ADC");
+                Console.WriteLine("8. Clear migration data (delete rows in ADC based on IdMapping)");
                 Console.Write("Select an option: ");
                 
                 var key = Console.ReadLine();
@@ -72,6 +74,12 @@ namespace Logistics.DbMerger
                             break;
                         case "6":
                             return;
+                        case "7":
+                            await RunListTablesOnlyInMdcAndCreateStructureAsync(sourceConn, targetConn, dryRun);
+                            break;
+                        case "8":
+                            await RunClearMigrationDataAsync(targetConn);
+                            break;
                         default:
                             Console.WriteLine("Invalid selection.");
                             break;
@@ -233,6 +241,21 @@ namespace Logistics.DbMerger
 
             var schemaSync = new SchemaSync(sourceConn, targetConn);
             var migrator = new DataMigrator(sourceConn, targetConn, batchSize);
+
+            // Bước 0: Tables only in MDC – ưu tiên đọc từ file (output/mdc_only_tables.txt), không có thì gọi GetTablesOnlyInMdcAsync
+            var fromFile = await Helper.ReadTableListFromNumberedFileAsync(Helper.MdcOnlyTablesFilePath);
+            HashSet<string> tablesOnlyInMdc;
+            if (fromFile.Count > 0)
+            {
+                tablesOnlyInMdc = fromFile.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                Console.WriteLine($"[DataSync] Tables only in MDC: {tablesOnlyInMdc.Count} (from file {Helper.MdcOnlyTablesFilePath})");
+            }
+            else
+            {
+                tablesOnlyInMdc = (await Helper.GetTablesOnlyInMdcAsync(sourceConn, targetConn, null, writeToFile: false))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                Console.WriteLine($"[DataSync] Tables only in MDC: {tablesOnlyInMdc.Count}");
+            }
             
             // 2b. Smart User Sync (Before generic tables)
             // Need to build User Map for Audit columns
@@ -243,7 +266,9 @@ namespace Logistics.DbMerger
             // Caching target tables is good for fuzzy matching.
             var existingAdcTables = (await schemaSync.GetExistingTargetTablesAsync()).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            var sourceTables = await schemaSync.GetExistingSourceTablesAsync();
+            var sourceTables = (await schemaSync.GetExistingSourceTablesAsync())
+                .Where(t => !TableSkipRules.ShouldSkipTable(t))
+                .ToList();
 
             // Match Fuzzy / Explicit
             // We need to iterate specifically in ORDER defined by MigrationConfig
@@ -269,71 +294,319 @@ namespace Logistics.DbMerger
             }
             
             Console.WriteLine($"[DataSync] Tables to Migrate (Ordered): {orderedTables.Count}");
-            
-            foreach (var table in orderedTables)
-            {
-                if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue; // Skip systems And Users
 
-                var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
-                string targetTable = table;
-                
-                // 1. Check Explicit Mapping
-                     if (ExplicitTableMappings.ContainsKey(table))
-                     {
-                         string mappedTarget = ExplicitTableMappings[table];
-                         targetTable = mappedTarget;
-                     
-                         if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
-                         {
-                             targetTable = mappedTarget;
-                             isNew = false;
-                             Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
-                             await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
-                         }
-                     else
-                     {
-                          Console.WriteLine($"[Map] Explicit target {targetTable} missing. Treating as new.");
-                     }
-                }
-                
-                // 2. Check Fuzzy Match (only if New and not explicitly mapped)
-                else if (isNew)
-                     {
-                     string bestMatch = GetBestFuzzyMatch(table, existingAdcTables);
-                     if (bestMatch != null)
-                     {
-                         targetTable = bestMatch;
-                         isNew = false; 
-                         Console.WriteLine($"[SmartMerge] Detected match: {table} (MDC) -> {targetTable} (ADC)");
-                         // Sync Schema for Fuzzy Match
-                         await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
-                     }
-                     // other fuzzy rules...
-                }
-                
-                // 3. Sync Schema for Exact Matches (Column Evolution)
-                if (!isNew && targetTable.Equals(table, StringComparison.OrdinalIgnoreCase))
+            if (!dryRun)
+            {
+                using var sourceConnection = new SqlConnection(sourceConn);
+                using var targetConnection = new SqlConnection(targetConn);
+                await sourceConnection.OpenAsync();
+                await targetConnection.OpenAsync();
+                await IdMappingSetup.CreateIdMappingTablesIfNotExistsAsync(targetConnection);
+                await FkConstraintHelper.DisableAllFkAsync(targetConnection);
+                var migrationBatch = Guid.NewGuid().ToString("N");
+                var pkInfoCache = new Dictionary<string, PkColumnInfo?>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var table in orderedTables)
                 {
-                     await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                    if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue;
+
+                    var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
+                    string targetTable = table;
+
+                    if (ExplicitTableMappings.ContainsKey(table))
+                    {
+                        string mappedTarget = ExplicitTableMappings[table];
+                        targetTable = mappedTarget;
+                        if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
+                        {
+                            targetTable = mappedTarget;
+                            isNew = false;
+                            Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
+                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                        }
+                        else
+                            Console.WriteLine($"[Map] Explicit target {targetTable} missing. Treating as new.");
+                    }
+                    else if (isNew)
+                    {
+                        string? bestMatch = GetBestFuzzyMatch(table, existingAdcTables);
+                        if (bestMatch != null)
+                        {
+                            targetTable = bestMatch;
+                            isNew = false;
+                            Console.WriteLine($"[SmartMerge] Detected match: {table} (MDC) -> {targetTable} (ADC)");
+                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                        }
                     }
 
-                // 4. Data Migration
-                if (!dryRun)
-                {
-                   await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId, userMapping: userMapping);
+                    if (!isNew && targetTable.Equals(table, StringComparison.OrdinalIgnoreCase))
+                        await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+
+                    if (!pkInfoCache.TryGetValue(targetTable, out var pkInfo))
+                    {
+                        pkInfo = await DataMigrator.GetPkColumnInfoAsync(targetConnection, targetTable);
+                        pkInfoCache[targetTable] = pkInfo;
+                    }
+
+                    bool skipGlobalSinglePk = false;
+                    if (pkInfo != null && pkInfo.PkColumnCount == 1 && !await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable))
+                    {
+                        // Bảng không có TenantId, PK 1 cột: chỉ seed một lần (tenant chạy đầu tiên), các tenant sau skip.
+                        string? mappingTable = pkInfo.DataType switch
+                        {
+                            "int" => "IdMappingInt",
+                            "bigint" => "IdMappingBigInt",
+                            "uniqueidentifier" => "IdMappingGuid",
+                            _ => null
+                        };
+
+                        if (mappingTable != null)
+                        {
+                            var existingMappings = await targetConnection.ExecuteScalarAsync<int>(
+                                $"SELECT COUNT(1) FROM [dbo].[{mappingTable}] WHERE TableName = @TableName AND ColumnName = @ColumnName",
+                                new { TableName = targetTable, ColumnName = pkInfo.ColumnName });
+                            skipGlobalSinglePk = existingMappings > 0;
+                        }
+                        else
+                        {
+                            var tableEsc = targetTable.Replace("]", "]]");
+                            var existingRows = await targetConnection.ExecuteScalarAsync<int>(
+                                $"SELECT COUNT(1) FROM [dbo].[{tableEsc}]");
+                            skipGlobalSinglePk = existingRows > 0;
+                        }
+
+                        if (skipGlobalSinglePk)
+                        {
+                            Console.WriteLine($"[DataSync] Skipping global single-PK table '{targetTable}' (no TenantId, already seeded).");
+                            continue;
+                        }
+                    }
+
+                    if (tablesOnlyInMdc.Contains(targetTable))
+                    {
+                        await migrator.MigrateTableAsync(table, isNewTable: false, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
+                        if (pkInfo != null && (pkInfo.DataType == "int" || pkInfo.DataType == "bigint" || pkInfo.DataType == "uniqueidentifier"))
+                        {
+                            var mappingTable = pkInfo.DataType == "int" ? "IdMappingInt" : pkInfo.DataType == "bigint" ? "IdMappingBigInt" : "IdMappingGuid";
+                            var targetWhere = (targetTenantId.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable)) ? $" WHERE TenantId = {targetTenantId.Value}" : "";
+                            var pkColEsc = pkInfo.ColumnName.Replace("]", "]]");
+                            var tableEsc = targetTable.Replace("]", "]]");
+                            var bulkSql = $@"
+INSERT INTO [dbo].[{mappingTable}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
+SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FROM [dbo].[{tableEsc}]{targetWhere}";
+                            var inserted = await targetConnection.ExecuteAsync(bulkSql,
+                                new { TableName = targetTable, ColumnName = pkInfo.ColumnName, Batch = migrationBatch, TenantId = (int?)targetTenantId },
+                                commandTimeout: 600);
+                            if (inserted > 0) Console.WriteLine($"   -> IdMapping (MDC-only, bulk): {inserted} row(s) -> [dbo].[{mappingTable}]");
+                        }
+                    }
+                    else
+                    {
+                        if (pkInfo == null)
+                        {
+                            await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
+                        }
+                        else if (pkInfo.PkColumnCount == 1 && pkInfo.DataType != "int" && pkInfo.DataType != "bigint" && pkInfo.DataType != "uniqueidentifier")
+                        {
+                            await migrator.MigrateTableNaturalPkAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, sourceTenantId, targetTenantId, userMapping);
+                        }
+                        else if (pkInfo.PkColumnCount > 1)
+                        {
+                            var pkColumnNames = await DataMigrator.GetPkColumnNamesAsync(targetConnection, targetTable);
+                            var fkColumns = await DataMigrator.GetFkColumnsForTableAsync(targetConnection, targetTable);
+                            await migrator.MigrateCompositeKeyTableAsync(sourceConnection, targetConnection, table, targetTable, pkColumnNames, fkColumns, sourceTenantId, targetTenantId);
+                        }
+                        else
+                        {
+                            var whereClause = (sourceTenantId.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table)) ? $" WHERE TenantId = {sourceTenantId.Value}" : "";
+                            await migrator.CreateStagingTableAsync(sourceConnection, targetConnection, table, targetTable, pkInfo);
+                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, targetTenantId, whereClause, sourceTenantId, targetTenantId, userMapping);
+                        }
+                    }
                 }
-                else
+
+                await FkConstraintHelper.UpdateFkFromIdMappingAsync(targetConnection, migrationBatch, targetTenantId);
+            }
+            else
+            {
+                foreach (var table in orderedTables)
                 {
-                   Console.WriteLine($"[DryRun] Would migrate {table} -> {targetTable} (Tenant: {sourceTenantId} -> {targetTenantId})");
+                    if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue;
+
+                    var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
+                    string targetTable = table;
+
+                    if (ExplicitTableMappings.ContainsKey(table))
+                    {
+                        string mappedTarget = ExplicitTableMappings[table];
+                        targetTable = mappedTarget;
+                        if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
+                        {
+                            targetTable = mappedTarget;
+                            isNew = false;
+                            Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
+                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                        }
+                        else
+                            Console.WriteLine($"[Map] Explicit target {targetTable} missing. Treating as new.");
+                    }
+                    else if (isNew)
+                    {
+                        string? bestMatch = GetBestFuzzyMatch(table, existingAdcTables);
+                        if (bestMatch != null)
+                        {
+                            targetTable = bestMatch;
+                            isNew = false;
+                            Console.WriteLine($"[SmartMerge] Detected match: {table} (MDC) -> {targetTable} (ADC)");
+                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                        }
+                    }
+
+                    if (!isNew && targetTable.Equals(table, StringComparison.OrdinalIgnoreCase))
+                        await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+
+                    Console.WriteLine($"[DryRun] Would migrate {table} -> {targetTable} (Tenant: {sourceTenantId} -> {targetTenantId})");
                 }
             }
+        }
+
+        static async Task RunListTablesOnlyInMdcAndCreateStructureAsync(string sourceConn, string targetConn, bool dryRun)
+        {
+            Console.WriteLine("\n--> [Option 7] Tables only in MDC: list (console + file) and create structure in ADC");
+            var path = Helper.MdcOnlyTablesFilePath;
+            var list = await Helper.GetTablesOnlyInMdcAsync(sourceConn, targetConn, path, writeToFile: true);
+            Console.WriteLine($"Tables only in MDC (after skip rules): {list.Count}");
+            Console.WriteLine($"Output file: {Path.GetFullPath(path)}");
+            for (int i = 0; i < list.Count; i++)
+                Console.WriteLine($"  {i + 1}. {list[i]}");
+            if (list.Count == 0)
+            {
+                Console.WriteLine("Nothing to create.");
+                return;
+            }
+            if (dryRun)
+            {
+                Console.WriteLine("[DryRun] Would create table structure in ADC for the above.");
+                return;
+            }
+            var schemaSync = new SchemaSync(sourceConn, targetConn);
+            foreach (var table in list)
+            {
+                if (ExplicitTableMappings.ContainsKey(table))
+                {
+                    Console.WriteLine($"[Skip] {table} (explicitly mapped to existing table)");
+                    continue;
+                }
+                await schemaSync.SyncTableAsync(table);
+                Console.WriteLine($"  Created [dbo].[{table}]");
+            }
+            Console.WriteLine("Done.");
+        }
+
+        /// <summary>
+        /// Xóa data migration trên ADC dựa vào IdMapping (chỉ xóa các dòng có NewId trong IdMapping).
+        /// Tận dụng index (TableName, ColumnName) INCLUDE (NewId) trên bảng IdMapping.
+        /// </summary>
+        static async Task RunClearMigrationDataAsync(string targetConnStr)
+        {
+            Console.WriteLine("\n--> [Option 8] Clear migration data (delete rows in ADC based on IdMapping)");
+            Console.Write("[Optional] MigrationBatch (Enter = all batches, or paste batch ID): ");
+            var batchInput = Console.ReadLine()?.Trim();
+            Console.Write("[Optional] TenantId (Enter = all tenants, or number): ");
+            var tenantInput = Console.ReadLine()?.Trim();
+            int? filterTenantId = null;
+            if (!string.IsNullOrEmpty(tenantInput) && int.TryParse(tenantInput, out int tid))
+                filterTenantId = tid;
+
+            await using var conn = new SqlConnection(targetConnStr);
+            await conn.OpenAsync();
+            await IdMappingSetup.CreateIdMappingTablesIfNotExistsAsync(conn);
+            await FkConstraintHelper.DisableAllFkAsync(conn);
+
+            string? filterBatch = string.IsNullOrEmpty(batchInput) ? null : batchInput;
+            var totalDeleted = 0;
+
+            totalDeleted = await ProcessIdMappingTableAsync(conn, "IdMappingInt", filterBatch, filterTenantId);
+            totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingBigInt", filterBatch, filterTenantId);
+            totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingGuid", filterBatch, filterTenantId);
+
+            await FkConstraintHelper.EnableAllFkAsync(conn);
+            Console.WriteLine($"\n[Option 8] Done. Total rows deleted from data tables: {totalDeleted}.");
+        }
+
+        /// <summary>
+        /// For one IdMapping table: get distinct (TableName, ColumnName), delete from data tables by NewId (in batches), then delete from IdMapping.
+        /// </summary>
+        static async Task<int> ProcessIdMappingTableAsync(SqlConnection conn, string mappingTable, string? filterBatch, int? filterTenantId)
+        {
+            var tableList = await GetDistinctTableColumnFromIdMappingAsync(conn, mappingTable, filterBatch, filterTenantId);
+            if (tableList.Count == 0) return 0;
+
+            var dboTables = (await conn.QueryAsync<string>("SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID('dbo')"))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            const int deleteBatchSize = 50000;
+            int totalDeleted = 0;
+            foreach (var (tableName, columnName) in tableList)
+            {
+                if (!dboTables.Contains(tableName))
+                {
+                    Console.WriteLine($"  [Skip] Table not found: {tableName}");
+                    continue;
+                }
+
+                var tableEsc = tableName.Replace("]", "]]");
+                var colEsc = columnName.Replace("]", "]]");
+
+                var subWhere = " TableName = @TableName AND ColumnName = @ColumnName";
+                if (!string.IsNullOrEmpty(filterBatch)) subWhere += " AND MigrationBatch = @Batch";
+                if (filterTenantId.HasValue) subWhere += " AND TenantId = @TenantId";
+
+                var prm = new { TableName = tableName, ColumnName = columnName, Batch = filterBatch, TenantId = filterTenantId, BatchSize = deleteBatchSize };
+                var deleteDataSql = $@"DELETE TOP (@BatchSize) FROM [dbo].[{tableEsc}] WHERE [{colEsc}] IN (SELECT NewId FROM [dbo].[{mappingTable}] WHERE{subWhere})";
+
+                int tableDeleted = 0;
+                int deleted;
+                do
+                {
+                    deleted = await conn.ExecuteAsync(deleteDataSql, prm, commandTimeout: 600);
+                    tableDeleted += deleted;
+                } while (deleted == deleteBatchSize);
+
+                if (tableDeleted > 0)
+                {
+                    Console.WriteLine($"  Deleted {tableDeleted} row(s) from [dbo].[{tableName}]");
+                    totalDeleted += tableDeleted;
+                }
+
+                var deleteMappingSql = $@"DELETE FROM [dbo].[{mappingTable}] WHERE TableName = @TableName AND ColumnName = @ColumnName";
+                if (!string.IsNullOrEmpty(filterBatch)) deleteMappingSql += " AND MigrationBatch = @Batch";
+                if (filterTenantId.HasValue) deleteMappingSql += " AND TenantId = @TenantId";
+                await conn.ExecuteAsync(deleteMappingSql, prm, commandTimeout: 600);
+            }
+            return totalDeleted;
+        }
+
+        static async Task<List<(string TableName, string ColumnName)>> GetDistinctTableColumnFromIdMappingAsync(SqlConnection conn, string mappingTable, string? filterBatch, int? filterTenantId)
+        {
+            var sql = $"SELECT DISTINCT TableName, ColumnName FROM [dbo].[{mappingTable}] WHERE 1=1";
+            if (!string.IsNullOrEmpty(filterBatch)) sql += " AND MigrationBatch = @Batch";
+            if (filterTenantId.HasValue) sql += " AND TenantId = @TenantId";
+            var rows = await conn.QueryAsync<(string TableName, string ColumnName)>(sql, new { Batch = filterBatch, TenantId = filterTenantId });
+            return rows.ToList();
         }
 
         // Define Explicit Mappings (Source -> Target)
         private static readonly Dictionary<string, string> ExplicitTableMappings = new(StringComparer.OrdinalIgnoreCase)
         {
             { "ActualActivityConfiguration", "ActualActivityConfigurations" },
-            { "IndirectClockEvents", "IndirectClockEvent" }
+            { "IndirectClockEvent", "IndirectClockEvent" }
+        };
+
+        /// <summary>Tables that exist only in MDC with different structure from ADC; create new table with same name in ADC, do not fuzzy-match to singular/plural.</summary>
+        private static readonly HashSet<string> NoFuzzyMatchTables = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "IndirectClockEvents"
         };
 
         static async Task RunValidation(string sourceConn, string targetConn)
@@ -483,6 +756,8 @@ namespace Logistics.DbMerger
 
         static string GetBestFuzzyMatch(string sourceTable, HashSet<string> targetTables)
         {
+            if (NoFuzzyMatchTables.Contains(sourceTable))
+                return null;
             if (sourceTable.EndsWith("s") && targetTables.Contains(sourceTable.Substring(0, sourceTable.Length - 1)))
             {
                 return sourceTable.Substring(0, sourceTable.Length - 1);

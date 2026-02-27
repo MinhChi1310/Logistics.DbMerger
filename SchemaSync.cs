@@ -201,7 +201,7 @@ namespace Logistics.DbMerger
                 // Construct Options
                 var opts = new List<string>();
                 opts.Add($"PAD_INDEX = {(pkInfo.is_padded == true ? "ON" : "OFF")}");
-                opts.Add($"STATISTICS_NORECOMPUTE = {(pkInfo.no_recompute == 1 ? "ON" : "OFF")}"); 
+                opts.Add($"STATISTICS_NORECOMPUTE = {(pkInfo.no_recompute == true ? "ON" : "OFF")}"); 
                 opts.Add($"IGNORE_DUP_KEY = {(pkInfo.ignore_dup_key == true ? "ON" : "OFF")}");
                 opts.Add($"ALLOW_ROW_LOCKS = {(pkInfo.allow_row_locks == true ? "ON" : "OFF")}");
                 opts.Add($"ALLOW_PAGE_LOCKS = {(pkInfo.allow_page_locks == true ? "ON" : "OFF")}");
