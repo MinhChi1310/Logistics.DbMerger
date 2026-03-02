@@ -602,8 +602,9 @@ WHERE NOT EXISTS (SELECT 1 FROM [dbo].[{targetEsc}] t WHERE t.[{pkColEsc}] = s.[
             int? sourceTenantId,
             int? targetTenantId)
         {
+            bool hasTenantId = await TableHasTenantIdColumnAsync(sourceConn, sourceTableName);
             string whereClause = "";
-            if (sourceTenantId.HasValue && await TableHasTenantIdColumnAsync(sourceConn, sourceTableName))
+            if (sourceTenantId.HasValue && hasTenantId)
                 whereClause = $" WHERE TenantId = {sourceTenantId.Value}";
 
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
@@ -627,7 +628,7 @@ WHERE NOT EXISTS (SELECT 1 FROM [dbo].[{targetEsc}] t WHERE t.[{pkColEsc}] = s.[
             }
             Console.Write(".");
 
-            bool transformTenantId = sourceTenantId.HasValue && targetTenantId.HasValue && sourceTenantId != targetTenantId;
+            bool transformTenantId = sourceTenantId.HasValue && targetTenantId.HasValue && sourceTenantId != targetTenantId && hasTenantId;
             if (transformTenantId)
             {
                 await targetConn.ExecuteAsync(

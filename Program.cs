@@ -132,7 +132,7 @@ namespace Logistics.DbMerger
 
             foreach (var table in commonTables)
             {
-                if (table == "sysdiagrams" || table == "Tenants" || table.StartsWith("__")) continue;
+                if (table == "sysdiagrams" ||  table.StartsWith("__")) continue;// delete table == "Tenants" ||
 
                 // This adds missing columns if any
                 await schemaSync.SyncTableSchemaAsync(table, table, dryRun);
@@ -172,14 +172,18 @@ namespace Logistics.DbMerger
 
             // Interactive Tenant Prompt
             Console.Write("\n[Input] Enter Tenant Name to filter by (or press Enter for ALL): ");
-            // ... (rest of logic)
             string tenantName = Console.ReadLine()?.Trim();
             int? sourceTenantId = null;
             int? targetTenantId = null;
+            // When ALL: list of (SourceTenantId, TargetTenantId, DisplayName)
+            List<(int SourceId, int TargetId, string DisplayName)>? allTenantPairs = null;
 
             using (var source = new SqlConnection(sourceConn))
             using (var target = new SqlConnection(targetConn))
             {
+                await source.OpenAsync();
+                await target.OpenAsync();
+
                 if (!string.IsNullOrEmpty(tenantName))
                 {
                     // 1. Resolve Source Tenant
@@ -195,7 +199,6 @@ namespace Logistics.DbMerger
                     Console.WriteLine($"[TenantFilter] Resolved Source ID: {sourceTenantId}");
 
                     // 2. Resolve/Create Target Tenant
-                    // Check if exists by Name (Assume Name unique)
                     var existingTargetId = await target.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE TenancyName = @Name", new { Name = tenantName });
                     if (existingTargetId == null)
                         existingTargetId = await target.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE Name = @Name", new { Name = tenantName });
@@ -209,33 +212,67 @@ namespace Logistics.DbMerger
                     {
                         if (!dryRun)
                         {
-                            // Create New Tenant in Target to generate new ID
                             Console.WriteLine($"[TenantMap] Creating new Tenant '{tenantName}' in Target...");
-                            
-                            // Fetch full row from source to clone properties? 
-                            // Or minimal insert? Using minimal for safety, or we should Clone.
-                            // Better to CLONE the tenant row from Source.
                             var sourceTenantRow = await source.QuerySingleAsync<dynamic>("SELECT * FROM Tenants WHERE Id = @Id", new { Id = sourceTenantId });
-                            
-                            // Generate INSERT sql dynamically based on dictionary?
-                            // Simplified: Insert Name, TenancyName, IsActive, etc.
-                            // We need to exclude 'Id' if Identity.
                             var props = (IDictionary<string, object>)sourceTenantRow;
                             var cols = props.Keys.Where(k => k != "Id").ToList();
                             var vals = cols.Select(k => "@" + k).ToList();
                             string insertSql = $"INSERT INTO Tenants ({string.Join(",", cols)}) VALUES ({string.Join(",", vals)}); SELECT CAST(SCOPE_IDENTITY() as int);";
-                            
                             targetTenantId = await target.ExecuteScalarAsync<int>(insertSql, (object)sourceTenantRow);
                             Console.WriteLine($"[TenantMap] Created Target Tenant. New ID: {targetTenantId}");
                         }
                         else
                         {
                             Console.WriteLine($"[DryRun] Would Create Tenant '{tenantName}' in Target.");
-                            targetTenantId = sourceTenantId; // Mock for dry run
+                            targetTenantId = sourceTenantId;
                         }
                     }
-                    
                     if (targetTenantId == null && dryRun) targetTenantId = sourceTenantId;
+                }
+                else
+                {
+                    // ALL tenants: resolve/create each tenant in target
+                    var sourceTenants = (await source.QueryAsync<(int Id, string? Name, string? TenancyName)>(
+                        "SELECT Id, Name, TenancyName FROM Tenants ORDER BY Id")).ToList();
+                    if (sourceTenants.Count == 0)
+                    {
+                        Console.WriteLine("[DataSync] No tenants found in Source.");
+                        return;
+                    }
+                    Console.WriteLine($"[TenantFilter] ALL tenants: {sourceTenants.Count} tenant(s) in Source.");
+                    allTenantPairs = new List<(int, int, string)>();
+                    foreach (var row in sourceTenants)
+                    {
+                        string nameForLookup = (row.TenancyName ?? row.Name ?? row.Id.ToString()) ?? "";
+                        var existingTargetId = await target.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE TenancyName = @Name", new { Name = nameForLookup });
+                        if (existingTargetId == null)
+                            existingTargetId = await target.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE Name = @Name", new { Name = nameForLookup });
+                        int targetId;
+                        if (existingTargetId != null)
+                        {
+                            targetId = existingTargetId.Value;
+                            Console.WriteLine($"[TenantMap] '{nameForLookup}' Source ID {row.Id} -> Target ID {targetId} (existing).");
+                        }
+                        else
+                        {
+                            if (!dryRun)
+                            {
+                                var sourceTenantRow = await source.QuerySingleAsync<dynamic>("SELECT * FROM Tenants WHERE Id = @Id", new { Id = row.Id });
+                                var props = (IDictionary<string, object>)sourceTenantRow;
+                                var cols = props.Keys.Where(k => k != "Id").ToList();
+                                var vals = cols.Select(k => "@" + k).ToList();
+                                string insertSql = $"INSERT INTO Tenants ({string.Join(",", cols)}) VALUES ({string.Join(",", vals)}); SELECT CAST(SCOPE_IDENTITY() as int);";
+                                targetId = await target.ExecuteScalarAsync<int>(insertSql, (object)sourceTenantRow);
+                                Console.WriteLine($"[TenantMap] '{nameForLookup}' Source ID {row.Id} -> Created Target ID {targetId}.");
+                            }
+                            else
+                            {
+                                targetId = row.Id;
+                                Console.WriteLine($"[DryRun] Would create Tenant '{nameForLookup}' in Target (mock TargetId: {targetId}).");
+                            }
+                        }
+                        allTenantPairs.Add((row.Id, targetId, nameForLookup));
+                    }
                 }
             }
 
@@ -258,10 +295,19 @@ namespace Logistics.DbMerger
             }
             
             // 2b. Smart User Sync (Before generic tables)
-            // Need to build User Map for Audit columns
             var userMapping = new Dictionary<long, long>();
-            // Only sync users if we are proceeding with data
-            await SyncUsersAsync(sourceConn, targetConn, userMapping, sourceTenantId, targetTenantId, dryRun);
+            if (allTenantPairs != null)
+            {
+                foreach (var (srcId, tgtId, displayName) in allTenantPairs)
+                {
+                    Console.WriteLine($"[Users] Syncing users for tenant: {displayName} (Source: {srcId} -> Target: {tgtId})");
+                    await SyncUsersAsync(sourceConn, targetConn, userMapping, srcId, tgtId, dryRun);
+                }
+            }
+            else
+            {
+                await SyncUsersAsync(sourceConn, targetConn, userMapping, sourceTenantId, targetTenantId, dryRun);
+            }
 
             // Caching target tables is good for fuzzy matching.
             var existingAdcTables = (await schemaSync.GetExistingTargetTablesAsync()).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -306,9 +352,20 @@ namespace Logistics.DbMerger
                 var migrationBatch = Guid.NewGuid().ToString("N");
                 var pkInfoCache = new Dictionary<string, PkColumnInfo?>(StringComparer.OrdinalIgnoreCase);
 
-                foreach (var table in orderedTables)
+                var tenantsToRun = allTenantPairs != null
+                    ? allTenantPairs
+                    : new List<(int SourceId, int TargetId, string DisplayName)> { (sourceTenantId!.Value, targetTenantId!.Value, tenantName ?? "Single") };
+
+                foreach (var (curSourceId, curTargetId, curDisplayName) in tenantsToRun)
                 {
-                    if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue;
+                    int? src = curSourceId;
+                    int? tgt = curTargetId;
+                    if (allTenantPairs != null)
+                        Console.WriteLine($"[DataSync] --- Tenant: {curDisplayName} (SourceId: {curSourceId} -> TargetId: {curTargetId}) ---");
+
+                    foreach (var table in orderedTables)
+                    {
+                        if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue;
 
                     var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
                     string targetTable = table;
@@ -384,18 +441,18 @@ namespace Logistics.DbMerger
 
                     if (tablesOnlyInMdc.Contains(targetTable))
                     {
-                        await migrator.MigrateTableAsync(table, isNewTable: false, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
+                        await migrator.MigrateTableAsync(table, isNewTable: false, targetTableName: targetTable, sourceTenantId: src, targetTenantId: tgt, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
                         if (pkInfo != null && (pkInfo.DataType == "int" || pkInfo.DataType == "bigint" || pkInfo.DataType == "uniqueidentifier"))
                         {
                             var mappingTable = pkInfo.DataType == "int" ? "IdMappingInt" : pkInfo.DataType == "bigint" ? "IdMappingBigInt" : "IdMappingGuid";
-                            var targetWhere = (targetTenantId.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable)) ? $" WHERE TenantId = {targetTenantId.Value}" : "";
+                            var targetWhere = (tgt.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable)) ? $" WHERE TenantId = {tgt.Value}" : "";
                             var pkColEsc = pkInfo.ColumnName.Replace("]", "]]");
                             var tableEsc = targetTable.Replace("]", "]]");
                             var bulkSql = $@"
 INSERT INTO [dbo].[{mappingTable}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
 SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FROM [dbo].[{tableEsc}]{targetWhere}";
                             var inserted = await targetConnection.ExecuteAsync(bulkSql,
-                                new { TableName = targetTable, ColumnName = pkInfo.ColumnName, Batch = migrationBatch, TenantId = (int?)targetTenantId },
+                                new { TableName = targetTable, ColumnName = pkInfo.ColumnName, Batch = migrationBatch, TenantId = (int?)tgt },
                                 commandTimeout: 600);
                             if (inserted > 0) Console.WriteLine($"   -> IdMapping (MDC-only, bulk): {inserted} row(s) -> [dbo].[{mappingTable}]");
                         }
@@ -404,68 +461,77 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                     {
                         if (pkInfo == null)
                         {
-                            await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: sourceTenantId, targetTenantId: targetTenantId, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
+                            await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: src, targetTenantId: tgt, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
                         }
                         else if (pkInfo.PkColumnCount == 1 && pkInfo.DataType != "int" && pkInfo.DataType != "bigint" && pkInfo.DataType != "uniqueidentifier")
                         {
-                            await migrator.MigrateTableNaturalPkAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, sourceTenantId, targetTenantId, userMapping);
+                            await migrator.MigrateTableNaturalPkAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, src, tgt, userMapping);
                         }
                         else if (pkInfo.PkColumnCount > 1)
                         {
                             var pkColumnNames = await DataMigrator.GetPkColumnNamesAsync(targetConnection, targetTable);
                             var fkColumns = await DataMigrator.GetFkColumnsForTableAsync(targetConnection, targetTable);
-                            await migrator.MigrateCompositeKeyTableAsync(sourceConnection, targetConnection, table, targetTable, pkColumnNames, fkColumns, sourceTenantId, targetTenantId);
+                            await migrator.MigrateCompositeKeyTableAsync(sourceConnection, targetConnection, table, targetTable, pkColumnNames, fkColumns, src, tgt);
                         }
                         else
                         {
-                            var whereClause = (sourceTenantId.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table)) ? $" WHERE TenantId = {sourceTenantId.Value}" : "";
+                            var whereClause = (src.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table)) ? $" WHERE TenantId = {src.Value}" : "";
                             await migrator.CreateStagingTableAsync(sourceConnection, targetConnection, table, targetTable, pkInfo);
-                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, targetTenantId, whereClause, sourceTenantId, targetTenantId, userMapping);
+                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, tgt, whereClause, src, tgt, userMapping);
                         }
                     }
                 }
 
-                await FkConstraintHelper.UpdateFkFromIdMappingAsync(targetConnection, migrationBatch, targetTenantId);
+                await FkConstraintHelper.UpdateFkFromIdMappingAsync(targetConnection, migrationBatch, tgt);
+                }
             }
             else
             {
-                foreach (var table in orderedTables)
+                var dryRunTenants = allTenantPairs != null
+                    ? allTenantPairs
+                    : new List<(int SourceId, int TargetId, string DisplayName)> { (sourceTenantId!.Value, targetTenantId!.Value, tenantName ?? "Single") };
+                foreach (var (curSourceId, curTargetId, curDisplayName) in dryRunTenants)
                 {
-                    if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue;
-
-                    var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
-                    string targetTable = table;
-
-                    if (ExplicitTableMappings.ContainsKey(table))
+                    if (allTenantPairs != null)
+                        Console.WriteLine($"[DryRun] --- Tenant: {curDisplayName} (SourceId: {curSourceId} -> TargetId: {curTargetId}) ---");
+                    foreach (var table in orderedTables)
                     {
-                        string mappedTarget = ExplicitTableMappings[table];
-                        targetTable = mappedTarget;
-                        if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
+                        if (table == "sysdiagrams" || table == "Tenants" || table == "Users" || table.StartsWith("__")) continue;
+
+                        var isNew = !existingAdcTables.Contains(table, StringComparer.OrdinalIgnoreCase);
+                        string targetTable = table;
+
+                        if (ExplicitTableMappings.ContainsKey(table))
                         {
+                            string mappedTarget = ExplicitTableMappings[table];
                             targetTable = mappedTarget;
-                            isNew = false;
-                            Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
-                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                            if (existingAdcTables.Contains(mappedTarget, StringComparer.OrdinalIgnoreCase))
+                            {
+                                targetTable = mappedTarget;
+                                isNew = false;
+                                Console.WriteLine($"[SmartMerge] Applied explicit mapping: {table} (MDC) -> {targetTable} (ADC)");
+                                await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                            }
+                            else
+                                Console.WriteLine($"[Map] Explicit target {targetTable} missing. Treating as new.");
                         }
-                        else
-                            Console.WriteLine($"[Map] Explicit target {targetTable} missing. Treating as new.");
-                    }
-                    else if (isNew)
-                    {
-                        string? bestMatch = GetBestFuzzyMatch(table, existingAdcTables);
-                        if (bestMatch != null)
+                        else if (isNew)
                         {
-                            targetTable = bestMatch;
-                            isNew = false;
-                            Console.WriteLine($"[SmartMerge] Detected match: {table} (MDC) -> {targetTable} (ADC)");
-                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                            string? bestMatch = GetBestFuzzyMatch(table, existingAdcTables);
+                            if (bestMatch != null)
+                            {
+                                targetTable = bestMatch;
+                                isNew = false;
+                                Console.WriteLine($"[SmartMerge] Detected match: {table} (MDC) -> {targetTable} (ADC)");
+                                await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+                            }
                         }
+
+                        if (!isNew && targetTable.Equals(table, StringComparison.OrdinalIgnoreCase))
+                            await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
+
+                        Console.WriteLine($"[DryRun] Would migrate {table} -> {targetTable} (Tenant: {curSourceId} -> {curTargetId})");
                     }
-
-                    if (!isNew && targetTable.Equals(table, StringComparison.OrdinalIgnoreCase))
-                        await schemaSync.SyncTableSchemaAsync(table, targetTable, dryRun);
-
-                    Console.WriteLine($"[DryRun] Would migrate {table} -> {targetTable} (Tenant: {sourceTenantId} -> {targetTenantId})");
                 }
             }
         }
