@@ -727,7 +727,8 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             string whereClause,
             int? sourceTenantId,
             int? targetTenantId,
-            Dictionary<long, long>? userMapping)
+            Dictionary<long, long>? userMapping,
+            int mergeChunkSize = 0)
         {
             var stagingName = targetTableName + "_staging";
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
@@ -862,27 +863,66 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
                 _ => null
             };
             var pkSqlType = string.Equals(pkInfo.DataType, "uniqueidentifier", StringComparison.OrdinalIgnoreCase) ? "uniqueidentifier" : (string.Equals(pkInfo.DataType, "bigint", StringComparison.OrdinalIgnoreCase) ? "bigint" : "int");
-            var mergeSql = $@"
+            var stagingEsc = stagingName.Replace("]", "]]");
+            var targetEsc = targetTableName.Replace("]", "]]");
+            const int cmdTimeout = 600;
+
+            if (mergeChunkSize > 0 && mappingTable != null)
+            {
+                // MERGE theo chunk: mỗi chunk SELECT INTO #Chunk, MERGE, INSERT IdMapping, DELETE staging; giảm memory và timeout cho bảng lớn
+                var mappingTableEsc = mappingTable.Replace("]", "]]");
+                int totalMapped = 0;
+                int iteration = 0;
+                var chunkSql = $@"
+SELECT TOP (@ChunkSize) * INTO #Chunk FROM [dbo].[{stagingEsc}] ORDER BY OldId;
 DECLARE @Mapping TABLE (OldId {pkSqlType}, NewId {pkSqlType});
-MERGE [dbo].[{targetTableName}] AS t
-USING [dbo].[{stagingName}] AS s ON 1=0
+MERGE [dbo].[{targetEsc}] AS t
+USING #Chunk AS s ON 1=0
+WHEN NOT MATCHED THEN
+  INSERT ({string.Join(", ", insertCols)})
+  VALUES ({string.Join(", ", valueExprs)})
+OUTPUT s.OldId, inserted.[{pkColName}] INTO @Mapping(OldId, NewId);
+INSERT INTO [dbo].[{mappingTableEsc}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
+SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @Mapping;
+DELETE s FROM [dbo].[{stagingEsc}] s INNER JOIN #Chunk c ON s.OldId = c.OldId;
+SELECT COUNT(*) FROM @Mapping;";
+                var chunkPrm = new { ChunkSize = mergeChunkSize, TableName = targetTableName, ColumnName = pkColName, MigrationBatch = migrationBatch, TenantId = (int?)tenantId };
+                while (true)
+                {
+                    var rowsInChunk = await targetConn.ExecuteScalarAsync<int>(chunkSql, chunkPrm, commandTimeout: cmdTimeout);
+                    if (rowsInChunk == 0) break;
+                    totalMapped += rowsInChunk;
+                    iteration++;
+                    if (iteration % 10 == 0 || rowsInChunk < mergeChunkSize)
+                        Console.Write(".");
+                }
+                if (totalMapped > 0)
+                    Console.WriteLine($"\n   -> IdMapping (chunked): {totalMapped} row(s) -> [dbo].[{mappingTable}]");
+            }
+            else
+            {
+                var mergeSql = $@"
+DECLARE @Mapping TABLE (OldId {pkSqlType}, NewId {pkSqlType});
+MERGE [dbo].[{targetEsc}] AS t
+USING [dbo].[{stagingEsc}] AS s ON 1=0
 WHEN NOT MATCHED THEN
   INSERT ({string.Join(", ", insertCols)})
   VALUES ({string.Join(", ", valueExprs)})
 OUTPUT s.OldId, inserted.[{pkColName}] INTO @Mapping(OldId, NewId);";
-            if (mappingTable != null)
-            {
-                mergeSql += $@"
-INSERT INTO [dbo].[{mappingTable}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
+                if (mappingTable != null)
+                {
+                    var mappingTableEsc = mappingTable.Replace("]", "]]");
+                    mergeSql += $@"
+INSERT INTO [dbo].[{mappingTableEsc}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
 SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @Mapping;";
-            }
-
-            var prm = new { TableName = targetTableName, ColumnName = pkColName, MigrationBatch = migrationBatch, TenantId = (int?)tenantId };
-            var rowsAffected = await targetConn.ExecuteAsync(mergeSql, prm, commandTimeout: 600);
-            if (mappingTable != null && rowsAffected > 0)
-            {
-                var mappingCount = rowsAffected / 2; // MERGE rows + INSERT rows
-                Console.WriteLine($"   -> IdMapping (bulk): {mappingCount} row(s) -> [dbo].[{mappingTable}]");
+                }
+                var prm = new { TableName = targetTableName, ColumnName = pkColName, MigrationBatch = migrationBatch, TenantId = (int?)tenantId };
+                var rowsAffected = await targetConn.ExecuteAsync(mergeSql, prm, commandTimeout: cmdTimeout);
+                if (mappingTable != null && rowsAffected > 0)
+                {
+                    var mappingCount = rowsAffected / 2;
+                    Console.WriteLine($"   -> IdMapping (bulk): {mappingCount} row(s) -> [dbo].[{mappingTable}]");
+                }
             }
 
             await DropStagingTableIfExistsAsync(targetConn, stagingName);

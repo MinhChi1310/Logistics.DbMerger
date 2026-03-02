@@ -21,6 +21,7 @@ namespace Logistics.DbMerger
             string targetConn = config.GetConnectionString("TargetAdc");
             bool dryRun = config.GetValue<bool>("Settings:DryRun");
             int batchSize = config.GetValue<int>("Settings:BatchSize");
+            int mergeChunkSize = config.GetValue<int>("Settings:MergeChunkSize");
 
             if (string.IsNullOrEmpty(sourceConn) || string.IsNullOrEmpty(targetConn) || sourceConn.Contains("YOUR_"))
             {
@@ -35,7 +36,7 @@ namespace Logistics.DbMerger
                 // For now, let's keep it simple: if args exist, run Step 3 (Data) assuming Schema is done?
                 // Or just standard run. Let's redirect to standard full run if --tenant present.
                 Console.WriteLine("[Auto-Run] Arguments detected. Running full migration...");
-                await RunFullMigration(sourceConn, targetConn, batchSize, dryRun, args);
+                await RunFullMigration(sourceConn, targetConn, batchSize, dryRun, args, mergeChunkSize);
                 return;
             }
 
@@ -64,7 +65,7 @@ namespace Logistics.DbMerger
                             await RunObjectSync(sourceConn, targetConn, dryRun);
                             break;
                         case "3":
-                            await RunDataSync(sourceConn, targetConn, batchSize, dryRun);
+                            await RunDataSync(sourceConn, targetConn, batchSize, dryRun, mergeChunkSize);
                             break;
                         case "4":
                             await RunValidation(sourceConn, targetConn);
@@ -162,7 +163,7 @@ namespace Logistics.DbMerger
             await objectSync.SyncObjectsAsync(dryRun);
         }
 
-        static async Task RunDataSync(string sourceConn, string targetConn, int batchSize, bool dryRun)
+        static async Task RunDataSync(string sourceConn, string targetConn, int batchSize, bool dryRun, int mergeChunkSize = 0)
         {
             Console.WriteLine("\n--> [Step 3] Data Sync");
             // Data Step doesn't necessarily create objects to rollback (except fuzzy match columns?)
@@ -349,6 +350,14 @@ namespace Logistics.DbMerger
                 await targetConnection.OpenAsync();
                 await IdMappingSetup.CreateIdMappingTablesIfNotExistsAsync(targetConnection);
                 await FkConstraintHelper.DisableAllFkAsync(targetConnection);
+                // When running ALL tenants, clear completed-tenant file so single-tenant tracking stays separate
+                if (allTenantPairs != null)
+                {
+                    var completedPath = Helper.DataSyncCompletedTenantIdsFilePath;
+                    if (File.Exists(completedPath)) File.Delete(completedPath);
+                }
+                try
+                {
                 var migrationBatch = Guid.NewGuid().ToString("N");
                 var pkInfoCache = new Dictionary<string, PkColumnInfo?>(StringComparer.OrdinalIgnoreCase);
 
@@ -477,12 +486,46 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                         {
                             var whereClause = (src.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table)) ? $" WHERE TenantId = {src.Value}" : "";
                             await migrator.CreateStagingTableAsync(sourceConnection, targetConnection, table, targetTable, pkInfo);
-                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, tgt, whereClause, src, tgt, userMapping);
+                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, tgt, whereClause, src, tgt, userMapping, mergeChunkSize);
                         }
                     }
                 }
 
                 await FkConstraintHelper.UpdateFkFromIdMappingAsync(targetConnection, migrationBatch, tgt);
+                }
+                }
+                finally
+                {
+                    if (allTenantPairs != null)
+                    {
+                        await FkConstraintHelper.EnableAllFkAsync(targetConnection);
+                        Console.WriteLine("[DataSync] Re-enabled all foreign keys.");
+                    }
+                    else
+                    {
+                        // Single-tenant run: persist completed tenant ID, then enable FK only when all tenants are done
+                        var completedPath = Helper.DataSyncCompletedTenantIdsFilePath;
+                        var dir = Path.GetDirectoryName(completedPath);
+                        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                        var existingIds = new HashSet<int>();
+                        if (File.Exists(completedPath))
+                        {
+                            foreach (var line in await File.ReadAllLinesAsync(completedPath))
+                                if (int.TryParse(line.Trim(), out var id)) existingIds.Add(id);
+                        }
+                        if (sourceTenantId.HasValue) existingIds.Add(sourceTenantId.Value);
+                        await File.WriteAllLinesAsync(completedPath, existingIds.OrderBy(x => x).Select(x => x.ToString()));
+
+                        var allSourceIds = (await sourceConnection.QueryAsync<int>("SELECT Id FROM Tenants")).ToHashSet();
+                        if (existingIds.SetEquals(allSourceIds))
+                        {
+                            await FkConstraintHelper.EnableAllFkAsync(targetConnection);
+                            Console.WriteLine("[DataSync] All tenants completed. Re-enabled all foreign keys.");
+                            if (File.Exists(completedPath)) File.Delete(completedPath);
+                        }
+                        else
+                            Console.WriteLine($"[DataSync] Single-tenant run completed. Completed: {existingIds.Count}, Total source tenants: {allSourceIds.Count}. FK left disabled until all tenants are synced.");
+                    }
                 }
             }
             else
@@ -737,12 +780,11 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
             }
         }
 
-        static async Task RunFullMigration(string sourceConn, string targetConn, int batchSize, bool dryRun, string[] args)
+        static async Task RunFullMigration(string sourceConn, string targetConn, int batchSize, bool dryRun, string[] args, int mergeChunkSize = 0)
         {
-             // Legacy wrapper for auto-run
              await RunSchemaSync(sourceConn, targetConn, dryRun);
              await RunObjectSync(sourceConn, targetConn, dryRun);
-             await RunDataSync(sourceConn, targetConn, batchSize, dryRun);
+             await RunDataSync(sourceConn, targetConn, batchSize, dryRun, mergeChunkSize);
         }
 
 

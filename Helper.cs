@@ -370,6 +370,11 @@ namespace Logistics.DbMerger
         public static readonly string MdcOnlyTablesFilePath = Path.Combine("output", "mdc_only_tables.txt");
 
         /// <summary>
+        /// File to persist completed tenant IDs when running Data Sync per-tenant. Used to decide when to re-enable FK (all tenants completed).
+        /// </summary>
+        public static readonly string DataSyncCompletedTenantIdsFilePath = Path.Combine("output", "data_sync_completed_tenant_ids.txt");
+
+        /// <summary>
         /// Reads table names from a file produced by WriteNumberedTableListToFileAsync (lines like "1. TableName").
         /// Returns empty list if file does not exist or is invalid.
         /// </summary>
