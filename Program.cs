@@ -22,6 +22,8 @@ namespace Logistics.DbMerger
             bool dryRun = config.GetValue<bool>("Settings:DryRun");
             int batchSize = config.GetValue<int>("Settings:BatchSize");
             int mergeChunkSize = config.GetValue<int>("Settings:MergeChunkSize");
+            var highTimeoutTables = config.GetSection("Settings:HighTimeoutTables").Get<string[]>() ?? Array.Empty<string>();
+            int highTimeoutSeconds = config.GetValue<int>("Settings:HighTimeoutSeconds");
 
             if (string.IsNullOrEmpty(sourceConn) || string.IsNullOrEmpty(targetConn) || sourceConn.Contains("YOUR_"))
             {
@@ -36,7 +38,7 @@ namespace Logistics.DbMerger
                 // For now, let's keep it simple: if args exist, run Step 3 (Data) assuming Schema is done?
                 // Or just standard run. Let's redirect to standard full run if --tenant present.
                 Console.WriteLine("[Auto-Run] Arguments detected. Running full migration...");
-                await RunFullMigration(sourceConn, targetConn, batchSize, dryRun, args, mergeChunkSize);
+                await RunFullMigration(sourceConn, targetConn, batchSize, dryRun, args, mergeChunkSize, highTimeoutTables, highTimeoutSeconds);
                 return;
             }
 
@@ -65,7 +67,7 @@ namespace Logistics.DbMerger
                             await RunObjectSync(sourceConn, targetConn, dryRun);
                             break;
                         case "3":
-                            await RunDataSync(sourceConn, targetConn, batchSize, dryRun, mergeChunkSize);
+                            await RunDataSync(sourceConn, targetConn, batchSize, dryRun, mergeChunkSize, highTimeoutTables, highTimeoutSeconds);
                             break;
                         case "4":
                             await RunValidation(sourceConn, targetConn);
@@ -167,7 +169,7 @@ namespace Logistics.DbMerger
             await objectSync.SyncObjectsAsync(dryRun);
         }
 
-        static async Task RunDataSync(string sourceConn, string targetConn, int batchSize, bool dryRun, int mergeChunkSize = 0)
+        static async Task RunDataSync(string sourceConn, string targetConn, int batchSize, bool dryRun, int mergeChunkSize = 0, string[]? highTimeoutTables = null, int highTimeoutSeconds = 0)
         {
             Console.WriteLine("\n--> [Step 3] Data Sync");
             // Data Step doesn't necessarily create objects to rollback (except fuzzy match columns?)
@@ -454,6 +456,7 @@ namespace Logistics.DbMerger
 
                     if (tablesOnlyInMdc.Contains(targetTable))
                     {
+                        Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: MDC-only (copy from MDC, no delete) | TenantId: {(tgt.HasValue ? tgt.ToString() : "all")}");
                         await migrator.MigrateTableAsync(table, isNewTable: false, targetTableName: targetTable, sourceTenantId: src, targetTenantId: tgt, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
                         if (pkInfo != null && (pkInfo.DataType == "int" || pkInfo.DataType == "bigint" || pkInfo.DataType == "uniqueidentifier"))
                         {
@@ -469,28 +472,40 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                                 commandTimeout: 600);
                             if (inserted > 0) Console.WriteLine($"   -> IdMapping (MDC-only, bulk): {inserted} row(s) -> [dbo].[{mappingTable}]");
                         }
+                        Console.WriteLine($"   -> Done: {table}");
                     }
                     else
                     {
                         if (pkInfo == null)
                         {
+                            Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: Direct MigrateTable (no PK/IdMapping) | TenantId: {(src.HasValue ? src.ToString() : "all")}");
                             await migrator.MigrateTableAsync(table, isNewTable: isNew, targetTableName: targetTable, sourceTenantId: src, targetTenantId: tgt, userMapping: userMapping, externalSourceConn: sourceConnection, externalTargetConn: targetConnection);
+                            Console.WriteLine($"   -> Done: {table}");
                         }
                         else if (pkInfo.PkColumnCount == 1 && pkInfo.DataType != "int" && pkInfo.DataType != "bigint" && pkInfo.DataType != "uniqueidentifier")
                         {
+                            Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: Natural PK (insert missing only) | TenantId: {(src.HasValue ? src.ToString() : "all")}");
                             await migrator.MigrateTableNaturalPkAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, src, tgt, userMapping);
+                            Console.WriteLine($"   -> Done: {table}");
                         }
                         else if (pkInfo.PkColumnCount > 1)
                         {
+                            Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: Composite PK (staging -> INSERT with IdMapping JOIN) | TenantId: {(src.HasValue ? src.ToString() : "all")}");
                             var pkColumnNames = await DataMigrator.GetPkColumnNamesAsync(targetConnection, targetTable);
                             var fkColumns = await DataMigrator.GetFkColumnsForTableAsync(targetConnection, targetTable);
                             await migrator.MigrateCompositeKeyTableAsync(sourceConnection, targetConnection, table, targetTable, pkColumnNames, fkColumns, src, tgt);
+                            Console.WriteLine($"   -> Done: {table}");
                         }
                         else
                         {
+                            Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: Staging + MERGE + IdMapping (single PK int/bigint/guid) | TenantId: {(tgt.HasValue ? tgt.ToString() : "null")}");
                             var whereClause = (src.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table)) ? $" WHERE TenantId = {src.Value}" : "";
                             await migrator.CreateStagingTableAsync(sourceConnection, targetConnection, table, targetTable, pkInfo);
-                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, tgt, whereClause, src, tgt, userMapping, mergeChunkSize);
+                            int? commandTimeoutOverride = (highTimeoutTables?.Contains(targetTable, StringComparer.OrdinalIgnoreCase) == true && highTimeoutSeconds > 0) ? highTimeoutSeconds : null;
+                            if (commandTimeoutOverride.HasValue)
+                                Console.WriteLine($"   -> Using extended timeout: {commandTimeoutOverride.Value}s for this table.");
+                            await migrator.InsertTableWithIdMappingAsync(sourceConnection, targetConnection, table, targetTable, pkInfo, migrationBatch, tgt, whereClause, src, tgt, userMapping, mergeChunkSize, commandTimeoutOverride);
+                            Console.WriteLine($"   -> Done: {table}");
                         }
                     }
                 }
@@ -784,11 +799,11 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
             }
         }
 
-        static async Task RunFullMigration(string sourceConn, string targetConn, int batchSize, bool dryRun, string[] args, int mergeChunkSize = 0)
+        static async Task RunFullMigration(string sourceConn, string targetConn, int batchSize, bool dryRun, string[] args, int mergeChunkSize = 0, string[]? highTimeoutTables = null, int highTimeoutSeconds = 0)
         {
              await RunSchemaSync(sourceConn, targetConn, dryRun);
              await RunObjectSync(sourceConn, targetConn, dryRun);
-             await RunDataSync(sourceConn, targetConn, batchSize, dryRun, mergeChunkSize);
+             await RunDataSync(sourceConn, targetConn, batchSize, dryRun, mergeChunkSize, highTimeoutTables, highTimeoutSeconds);
         }
 
 

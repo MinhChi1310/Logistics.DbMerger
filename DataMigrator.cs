@@ -264,7 +264,8 @@ namespace Logistics.DbMerger
             bulkCopy.BatchSize = _batchSize;
             bulkCopy.BulkCopyTimeout = 600;
             bulkCopy.NotifyAfter = 1000;
-            bulkCopy.SqlRowsCopied += (sender, e) => Console.Write(".");
+            long streamedRows = 0;
+            bulkCopy.SqlRowsCopied += (sender, e) => { streamedRows = e.RowsCopied; Console.Write("."); };
 
             bool transformTenantId = (sourceTenantId.HasValue && targetTenantId.HasValue && sourceTenantId != targetTenantId && hasTenantId);
             bool transformUsers = (userMapping != null && userMapping.Count > 0);
@@ -392,9 +393,8 @@ namespace Logistics.DbMerger
                 }
                 try
                 {
-
                     await bulkCopy.WriteToServerAsync(reader);
-                    Console.WriteLine($"\n[Data] Completed {sourceTableName}");
+                    Console.WriteLine($"\n[Data] Completed {sourceTableName} | Rows copied: {streamedRows} (streaming BulkCopy)");
                 }
                 catch (Exception ex)
                 {
@@ -728,8 +728,10 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             int? sourceTenantId,
             int? targetTenantId,
             Dictionary<long, long>? userMapping,
-            int mergeChunkSize = 0)
+            int mergeChunkSize = 0,
+            int? commandTimeoutOverride = null)
         {
+            int cmdTimeout = commandTimeoutOverride ?? 600;
             var stagingName = targetTableName + "_staging";
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
             var pkColName = pkInfo.ColumnName;
@@ -742,13 +744,13 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             var selectSql = "SELECT " + string.Join(", ", selectParts) + $" FROM [{sourceTableName}]{whereClause}";
 
             using var selectCmd = new SqlCommand(selectSql, sourceConn);
-            selectCmd.CommandTimeout = 600;
+            selectCmd.CommandTimeout = cmdTimeout;
             using var reader = await selectCmd.ExecuteReaderAsync();
 
             var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.TableLock, null);
             bulkCopy.DestinationTableName = stagingName;
             bulkCopy.BatchSize = _batchSize;
-            bulkCopy.BulkCopyTimeout = 600;
+            bulkCopy.BulkCopyTimeout = cmdTimeout;
             bulkCopy.NotifyAfter = 1000;
             bulkCopy.SqlRowsCopied += (_, _) => Console.Write(".");
 
@@ -865,7 +867,6 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             var pkSqlType = string.Equals(pkInfo.DataType, "uniqueidentifier", StringComparison.OrdinalIgnoreCase) ? "uniqueidentifier" : (string.Equals(pkInfo.DataType, "bigint", StringComparison.OrdinalIgnoreCase) ? "bigint" : "int");
             var stagingEsc = stagingName.Replace("]", "]]");
             var targetEsc = targetTableName.Replace("]", "]]");
-            const int cmdTimeout = 600;
 
             if (mergeChunkSize > 0 && mappingTable != null)
             {
@@ -897,7 +898,10 @@ SELECT COUNT(*) FROM @Mapping;";
                         Console.Write(".");
                 }
                 if (totalMapped > 0)
-                    Console.WriteLine($"\n   -> IdMapping (chunked): {totalMapped} row(s) -> [dbo].[{mappingTable}]");
+                {
+                    Console.WriteLine($"\n   -> Inserted {totalMapped} row(s) into [dbo].[{targetTableName}] (chunked MERGE)");
+                    Console.WriteLine($"   -> IdMapping (chunked): {totalMapped} row(s) -> [dbo].[{mappingTable}]");
+                }
             }
             else
             {
@@ -918,10 +922,12 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
                 }
                 var prm = new { TableName = targetTableName, ColumnName = pkColName, MigrationBatch = migrationBatch, TenantId = (int?)tenantId };
                 var rowsAffected = await targetConn.ExecuteAsync(mergeSql, prm, commandTimeout: cmdTimeout);
-                if (mappingTable != null && rowsAffected > 0)
+                var insertedCount = mappingTable != null ? rowsAffected / 2 : rowsAffected;
+                if (insertedCount > 0)
                 {
-                    var mappingCount = rowsAffected / 2;
-                    Console.WriteLine($"   -> IdMapping (bulk): {mappingCount} row(s) -> [dbo].[{mappingTable}]");
+                    Console.WriteLine($"   -> Inserted {insertedCount} row(s) into [dbo].[{targetTableName}]");
+                    if (mappingTable != null)
+                        Console.WriteLine($"   -> IdMapping (bulk): {insertedCount} row(s) -> [dbo].[{mappingTable}]");
                 }
             }
 
