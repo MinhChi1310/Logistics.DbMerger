@@ -750,7 +750,8 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.TableLock, null);
             bulkCopy.DestinationTableName = stagingName;
             bulkCopy.BatchSize = _batchSize;
-            bulkCopy.BulkCopyTimeout = cmdTimeout;
+            // For large-table runs (commandTimeoutOverride set), use 0 = no timeout so bulk copy is not killed
+            bulkCopy.BulkCopyTimeout = commandTimeoutOverride.HasValue ? 0 : cmdTimeout;
             bulkCopy.NotifyAfter = 1000;
             bulkCopy.SqlRowsCopied += (_, _) => Console.Write(".");
 
