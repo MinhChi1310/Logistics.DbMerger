@@ -379,6 +379,23 @@ namespace Logistics.DbMerger
                 {
                 var migrationBatch = Guid.NewGuid().ToString("N");
                 var pkInfoCache = new Dictionary<string, PkColumnInfo?>(StringComparer.OrdinalIgnoreCase);
+                var tableHasTenantIdTargetCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                var tableHasTenantIdSourceCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+                async Task<bool> GetTargetTableHasTenantIdAsync(string name)
+                {
+                    if (tableHasTenantIdTargetCache.TryGetValue(name, out var v)) return v;
+                    var r = await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, name);
+                    tableHasTenantIdTargetCache[name] = r;
+                    return r;
+                }
+                async Task<bool> GetSourceTableHasTenantIdAsync(string name)
+                {
+                    if (tableHasTenantIdSourceCache.TryGetValue(name, out var v)) return v;
+                    var r = await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, name);
+                    tableHasTenantIdSourceCache[name] = r;
+                    return r;
+                }
 
                 var tenantsToRun = allTenantPairs != null
                     ? allTenantPairs
@@ -444,7 +461,7 @@ namespace Logistics.DbMerger
                         }
 
                         bool skipGlobalSinglePk = false;
-                        if (pkInfo != null && pkInfo.PkColumnCount == 1 && !await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable))
+                        if (pkInfo != null && pkInfo.PkColumnCount == 1 && !await GetTargetTableHasTenantIdAsync(targetTable))
                         {
                             // Bảng không có TenantId, PK 1 cột: chỉ seed một lần (tenant chạy đầu tiên), các tenant sau skip.
                             string? mappingTable = pkInfo.DataType switch
@@ -484,7 +501,7 @@ namespace Logistics.DbMerger
                             if (pkInfo != null && (pkInfo.DataType == "int" || pkInfo.DataType == "bigint" || pkInfo.DataType == "uniqueidentifier"))
                             {
                                 var mappingTable = pkInfo.DataType == "int" ? "IdMappingInt" : pkInfo.DataType == "bigint" ? "IdMappingBigInt" : "IdMappingGuid";
-                                var targetWhere = (tgt.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable)) ? $" WHERE TenantId = {tgt.Value}" : "";
+                                var targetWhere = (tgt.HasValue && await GetTargetTableHasTenantIdAsync(targetTable)) ? $" WHERE TenantId = {tgt.Value}" : "";
                                 var pkColEsc = pkInfo.ColumnName.Replace("]", "]]");
                                 var tableEsc = targetTable.Replace("]", "]]");
                                 var bulkSql = $@"
@@ -522,7 +539,7 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                             else
                             {
                                 Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: Staging + MERGE + IdMapping (single PK int/bigint/guid) | TenantId: {(tgt.HasValue ? tgt.ToString() : "null")}");
-                                var whereClause = (src.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table)) ? $" WHERE TenantId = {src.Value}" : "";
+                                var whereClause = (src.HasValue && await GetSourceTableHasTenantIdAsync(table)) ? $" WHERE TenantId = {src.Value}" : "";
                                 await migrator.CreateStagingTableAsync(sourceConnection, targetConnection, table, targetTable, pkInfo);
                                 int? commandTimeoutOverride = GetExtendedTimeoutForTable(targetTable, veryHighTimeoutTables, veryHighTimeoutSeconds, highTimeoutTables, highTimeoutSeconds);
                                 if (commandTimeoutOverride.HasValue)
@@ -706,7 +723,10 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
 
         /// <summary>
         /// For one IdMapping table: get distinct (TableName, ColumnName), delete from data tables by NewId (in batches), then delete from IdMapping.
+        /// Uses extended timeout (3600s) for large IdMapping / data tables.
         /// </summary>
+        const int Option8CommandTimeoutSeconds = 3600;
+
         static async Task<int> ProcessIdMappingTableAsync(SqlConnection conn, string mappingTable, string? filterBatch, int? filterTenantId)
         {
             var tableList = await GetDistinctTableColumnFromIdMappingAsync(conn, mappingTable, filterBatch, filterTenantId);
@@ -739,7 +759,7 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                 int deleted;
                 do
                 {
-                    deleted = await conn.ExecuteAsync(deleteDataSql, prm, commandTimeout: 600);
+                    deleted = await conn.ExecuteAsync(deleteDataSql, prm, commandTimeout: Option8CommandTimeoutSeconds);
                     tableDeleted += deleted;
                 } while (deleted == deleteBatchSize);
 
@@ -752,7 +772,7 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                 var deleteMappingSql = $@"DELETE FROM [dbo].[{mappingTable}] WHERE TableName = @TableName AND ColumnName = @ColumnName";
                 if (!string.IsNullOrEmpty(filterBatch)) deleteMappingSql += " AND MigrationBatch = @Batch";
                 if (filterTenantId.HasValue) deleteMappingSql += " AND TenantId = @TenantId";
-                await conn.ExecuteAsync(deleteMappingSql, prm, commandTimeout: 600);
+                await conn.ExecuteAsync(deleteMappingSql, prm, commandTimeout: Option8CommandTimeoutSeconds);
             }
             return totalDeleted;
         }
@@ -1071,6 +1091,24 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                 {
                     var migrationBatch = Guid.NewGuid().ToString("N");
                     var pkInfoCache = new Dictionary<string, PkColumnInfo?>(StringComparer.OrdinalIgnoreCase);
+                    var tableHasTenantIdTargetCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                    var tableHasTenantIdSourceCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+                    async Task<bool> GetTargetTableHasTenantIdAsync(string name)
+                    {
+                        if (tableHasTenantIdTargetCache.TryGetValue(name, out var v)) return v;
+                        var r = await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, name);
+                        tableHasTenantIdTargetCache[name] = r;
+                        return r;
+                    }
+                    async Task<bool> GetSourceTableHasTenantIdAsync(string name)
+                    {
+                        if (tableHasTenantIdSourceCache.TryGetValue(name, out var v)) return v;
+                        var r = await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, name);
+                        tableHasTenantIdSourceCache[name] = r;
+                        return r;
+                    }
+
                     var existingAdcTables = (await schemaSync.GetExistingTargetTablesAsync())
                         .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -1130,7 +1168,7 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
 
                             bool skipGlobalSinglePk = false;
                             if (pkInfo != null && pkInfo.PkColumnCount == 1 &&
-                                !await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable))
+                                !await GetTargetTableHasTenantIdAsync(targetTable))
                             {
                                 string? mappingTable = pkInfo.DataType switch
                                 {
@@ -1174,7 +1212,7 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                                     var mappingTable = pkInfo.DataType == "int" ? "IdMappingInt"
                                         : pkInfo.DataType == "bigint" ? "IdMappingBigInt"
                                         : "IdMappingGuid";
-                                    var targetWhere = (tgt.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(targetConnection, targetTable))
+                                    var targetWhere = (tgt.HasValue && await GetTargetTableHasTenantIdAsync(targetTable))
                                         ? $" WHERE TenantId = {tgt.Value}"
                                         : "";
                                     var pkColEsc = pkInfo.ColumnName.Replace("]", "]]");
@@ -1223,7 +1261,7 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
                                 else
                                 {
                                     Console.WriteLine($"[Insert] Table: {table} -> [dbo].[{targetTable}] | Mode: Staging + MERGE + IdMapping (single PK int/bigint/guid) | TenantId: {(tgt.HasValue ? tgt.ToString() : "null")}");
-                                    var whereClause = (src.HasValue && await DataMigrator.TableHasTenantIdColumnAsync(sourceConnection, table))
+                                    var whereClause = (src.HasValue && await GetSourceTableHasTenantIdAsync(table))
                                         ? $" WHERE TenantId = {src.Value}"
                                         : "";
                                     await migrator.CreateStagingTableAsync(sourceConnection, targetConnection, table, targetTable, pkInfo);
