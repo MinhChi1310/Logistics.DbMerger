@@ -111,7 +111,12 @@ namespace Logistics.DbMerger
             Console.WriteLine("\n--> [Step 1] Schema Sync");
             RollbackLogger.Initialize("schema");
             var schemaSync = new SchemaSync(sourceConn, targetConn);
-            
+
+            // Get "tables only in MDC" before any schema change to ADC; Option 3/9 will read from this file only
+            Console.WriteLine("Writing tables only in MDC (before schema change)...");
+            await Helper.GetTablesOnlyInMdcAsync(sourceConn, targetConn, Helper.MdcOnlyTablesFilePath, writeToFile: true);
+            Console.WriteLine($"Saved to {Helper.MdcOnlyTablesFilePath}");
+
             Console.WriteLine("Checking missing tables...");
             var missingTables = await schemaSync.GetMissingTablesAsync();
             Console.WriteLine($"Found {missingTables.Count} missing tables.");
@@ -298,20 +303,15 @@ namespace Logistics.DbMerger
             var schemaSync = new SchemaSync(sourceConn, targetConn);
             var migrator = new DataMigrator(sourceConn, targetConn, batchSize);
 
-            // Bước 0: Tables only in MDC – ưu tiên đọc từ file (output/mdc_only_tables.txt), không có thì gọi GetTablesOnlyInMdcAsync
+            // Bước 0: Tables only in MDC – chỉ đọc từ file (đã ghi ở Option 1 trước khi thay đổi cấu trúc ADC)
             var fromFile = await Helper.ReadTableListFromNumberedFileAsync(Helper.MdcOnlyTablesFilePath);
-            HashSet<string> tablesOnlyInMdc;
+            var tablesOnlyInMdc = fromFile.Count > 0
+                ? fromFile.ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (fromFile.Count > 0)
-            {
-                tablesOnlyInMdc = fromFile.ToHashSet(StringComparer.OrdinalIgnoreCase);
                 Console.WriteLine($"[DataSync] Tables only in MDC: {tablesOnlyInMdc.Count} (from file {Helper.MdcOnlyTablesFilePath})");
-            }
             else
-            {
-                tablesOnlyInMdc = (await Helper.GetTablesOnlyInMdcAsync(sourceConn, targetConn, null, writeToFile: false))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                Console.WriteLine($"[DataSync] Tables only in MDC: {tablesOnlyInMdc.Count}");
-            }
+                Console.WriteLine($"[DataSync] Tables only in MDC: 0 (file empty or missing; run Option 1 first to generate {Helper.MdcOnlyTablesFilePath})");
             
             // 2b. Smart User Sync (Before generic tables)
             var userMapping = new Dictionary<long, long>();
@@ -1047,20 +1047,15 @@ SELECT @TableName, @ColumnName, [{pkColEsc}], [{pkColEsc}], @Batch, @TenantId FR
 
             Console.WriteLine($"[DataSyncByTier] Tables to migrate in selected tiers: {tierTables.Count}");
 
-            // 6. Tables only in MDC
-            var fromFile = await Helper.ReadTableListFromNumberedFileAsync(Helper.MdcOnlyTablesFilePath);
-            HashSet<string> tablesOnlyInMdc;
-            if (fromFile.Count > 0)
-            {
-                tablesOnlyInMdc = fromFile.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // 6. Tables only in MDC – chỉ đọc từ file (đã ghi ở Option 1 trước khi thay đổi cấu trúc ADC)
+            var fromFileTier = await Helper.ReadTableListFromNumberedFileAsync(Helper.MdcOnlyTablesFilePath);
+            var tablesOnlyInMdc = fromFileTier.Count > 0
+                ? fromFileTier.ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (fromFileTier.Count > 0)
                 Console.WriteLine($"[DataSyncByTier] Tables only in MDC: {tablesOnlyInMdc.Count} (from file {Helper.MdcOnlyTablesFilePath})");
-            }
             else
-            {
-                tablesOnlyInMdc = (await Helper.GetTablesOnlyInMdcAsync(sourceConn, targetConn, null, writeToFile: false))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                Console.WriteLine($"[DataSyncByTier] Tables only in MDC: {tablesOnlyInMdc.Count}");
-            }
+                Console.WriteLine($"[DataSyncByTier] Tables only in MDC: 0 (file empty or missing; run Option 1 first to generate {Helper.MdcOnlyTablesFilePath})");
 
             // 7. Smart User Sync (dùng chung với Option 3)
             var userMapping = new Dictionary<long, long>();
