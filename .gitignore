@@ -2,6 +2,7 @@
 [Bb]in/
 [Oo]bj/
 .vs/
+output/
 
 # Database Backups and SQL scripts
 *.bak

@@ -1,5 +1,6 @@
 using Dapper;
 using Microsoft.Data.SqlClient;
+using Serilog;
 using System.Text;
 
 namespace Logistics.DbMerger
@@ -15,144 +16,233 @@ namespace Logistics.DbMerger
             _targetConnStr = targetConnStr;
         }
 
-        public async Task RunValidationAsync(int? tenantId)
+        /// <summary>
+        /// Runs validation using separate source and target tenant IDs.
+        /// Source queries filter by sourceTenantId; target queries filter by targetTenantId.
+        /// </summary>
+        public async Task RunValidationAsync(int? sourceTenantId, int? targetTenantId)
         {
-            Console.WriteLine($"\n[Validation] Starting Validation for Tenant: {tenantId?.ToString() ?? "All"}");
-            
-            await ValidateRowCountsAsync(tenantId);
+            Log.Information("\n[Validation] Starting Validation — Source TenantId: {SourceTenantId}, Target TenantId: {TargetTenantId}",
+                sourceTenantId?.ToString() ?? "All", targetTenantId?.ToString() ?? "All");
+
+            var (matchCount, idMappingMatchCount, discrepancyCount) = await ValidateRowCountsAsync(sourceTenantId, targetTenantId);
             await ValidateForeignKeysAsync();
-            if (tenantId.HasValue)
+            if (targetTenantId.HasValue)
             {
-                await ValidateBusinessLogicAsync(tenantId.Value);
+                await ValidateBusinessLogicAsync(targetTenantId.Value);
             }
+            ReportWriter.WriteValidationReport(matchCount, idMappingMatchCount, discrepancyCount);
         }
 
-        private async Task ValidateRowCountsAsync(int? tenantId)
+        private async Task<(int MatchCount, int IdMappingMatchCount, int DiscrepancyCount)> ValidateRowCountsAsync(int? sourceTenantId, int? targetTenantId)
         {
-            Console.WriteLine("\n[1/3] Validating Row Counts...");
+            Log.Information("\n[1/3] Validating Row Counts...");
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
 
             var tables = await target.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'");
             var discrepancies = new List<string>();
+            int matchCount = 0;
+            int idMappingMatchCount = 0;
 
             foreach (var table in tables)
             {
-                try 
+                if (TableSkipRules.ShouldSkipTable(table))
+                    continue;
+
+                try
                 {
                     // Check if table exists in source
                     var sourceExists = await source.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @Name", new { Name = table }) > 0;
                     if (!sourceExists) continue;
 
-                    // Check for TenantID column
-                    var hasTenant = await target.ExecuteScalarAsync<int>($"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table}' AND COLUMN_NAME = 'TenantId'") > 0;
+                    // Check for TenantID column (case-insensitive via INFORMATION_SCHEMA)
+                    var hasTenantInTarget = await target.ExecuteScalarAsync<int>(
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName AND COLUMN_NAME IN ('TenantId','TenantID')",
+                        new { TableName = table }) > 0;
+                    var hasTenantInSource = await source.ExecuteScalarAsync<int>(
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @TableName AND COLUMN_NAME IN ('TenantId','TenantID')",
+                        new { TableName = table }) > 0;
 
-                    string query = $"SELECT COUNT(*) FROM [{table}]";
-                    string where = "";
-                    
-                    if (tenantId.HasValue && hasTenant)
+                    var tableEsc = table.Replace("]", "]]");
+
+                    if (hasTenantInSource && hasTenantInTarget && sourceTenantId.HasValue && targetTenantId.HasValue)
                     {
-                        where = $" WHERE TenantId = {tenantId}";
+                        // Tables with TenantId: direct count comparison filtered by tenant
+                        long sourceCount = await source.ExecuteScalarAsync<long>(
+                            $"SELECT COUNT(*) FROM [{tableEsc}] WHERE TenantId = @TenantId",
+                            new { TenantId = sourceTenantId });
+                        long targetCount = await target.ExecuteScalarAsync<long>(
+                            $"SELECT COUNT(*) FROM [{tableEsc}] WHERE TenantId = @TenantId",
+                            new { TenantId = targetTenantId });
+
+                        if (sourceCount != targetCount)
+                        {
+                            string msg = $"[MISMATCH] {table}: Source={sourceCount}, Target={targetCount}";
+                            Log.Warning("{Message}", msg);
+                            discrepancies.Add(msg);
+                            ReportWriter.AddValidationRow(table, sourceCount, targetCount, "Tenant", "MISMATCH");
+                        }
+                        else
+                        {
+                            matchCount++;
+                            ReportWriter.AddValidationRow(table, sourceCount, targetCount, "Tenant", "MATCH");
+                        }
                     }
-
-                    long sourceCount = await source.ExecuteScalarAsync<long>(query + where);
-                    long targetCount = await target.ExecuteScalarAsync<long>(query + where);
-
-                    if (sourceCount != targetCount)
+                    else if (!hasTenantInTarget && sourceTenantId.HasValue && targetTenantId.HasValue)
                     {
-                        string msg = $"[MISMATCH] {table}: Source={sourceCount}, Target={targetCount}";
-                        Console.WriteLine(msg);
-                        discrepancies.Add(msg);
+                        // Tables WITHOUT TenantId: use IdMapping to count migrated rows for this tenant
+                        // Check all three IdMapping tables for this table+tenant
+                        long idMappingCount = 0;
+                        foreach (var mappingTable in new[] { "IdMappingInt", "IdMappingBigInt", "IdMappingGuid" })
+                        {
+                            var mappingExists = await target.ExecuteScalarAsync<int>(
+                                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @Name",
+                                new { Name = mappingTable });
+                            if (mappingExists > 0)
+                            {
+                                idMappingCount += await target.ExecuteScalarAsync<long>(
+                                    $"SELECT COUNT(*) FROM [{mappingTable}] WHERE TableName = @TableName AND TenantId = @TenantId",
+                                    new { TableName = table, TenantId = targetTenantId });
+                            }
+                        }
+
+                        if (idMappingCount == 0)
+                        {
+                            // No IdMapping entries — table may be global, composite-PK, or was skipped; skip validation
+                            continue;
+                        }
+
+                        // Source count: filter by source tenant if source has TenantId, otherwise count all
+                        long sourceCount;
+                        if (hasTenantInSource)
+                            sourceCount = await source.ExecuteScalarAsync<long>(
+                                $"SELECT COUNT(*) FROM [{tableEsc}] WHERE TenantId = @TenantId",
+                                new { TenantId = sourceTenantId });
+                        else
+                            sourceCount = await source.ExecuteScalarAsync<long>($"SELECT COUNT(*) FROM [{tableEsc}]");
+
+                        if (sourceCount != idMappingCount)
+                        {
+                            string msg = $"[MISMATCH] {table} (via IdMapping): Source={sourceCount}, Migrated={idMappingCount}";
+                            Log.Warning("{Message}", msg);
+                            discrepancies.Add(msg);
+                            ReportWriter.AddValidationRow(table, sourceCount, idMappingCount, "IdMapping", "MISMATCH");
+                        }
+                        else
+                        {
+                            Log.Information("[Validator] {Table} (via IdMapping): {Count} rows — MATCH", table, idMappingCount);
+                            idMappingMatchCount++;
+                            ReportWriter.AddValidationRow(table, sourceCount, idMappingCount, "IdMapping", "MATCH");
+                        }
                     }
                     else
                     {
-                        // Console.WriteLine($"[OK] {table}: {sourceCount}");
+                        // ALL tenants mode or no tenant filter: full table count comparison
+                        long sourceCount = await source.ExecuteScalarAsync<long>($"SELECT COUNT(*) FROM [{tableEsc}]");
+                        long targetCount = await target.ExecuteScalarAsync<long>($"SELECT COUNT(*) FROM [{tableEsc}]");
+
+                        if (sourceCount != targetCount)
+                        {
+                            string msg = $"[MISMATCH] {table}: Source={sourceCount}, Target={targetCount}";
+                            Log.Warning("{Message}", msg);
+                            discrepancies.Add(msg);
+                            ReportWriter.AddValidationRow(table, sourceCount, targetCount, "Full", "MISMATCH");
+                        }
+                        else
+                        {
+                            matchCount++;
+                            ReportWriter.AddValidationRow(table, sourceCount, targetCount, "Full", "MATCH");
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[Skip] {table}: {ex.Message}");
+                    Log.Warning("[Skip] {Table}: {ErrorMessage}", table, ex.Message);
                 }
             }
-            
-            if (discrepancies.Count == 0) Console.WriteLine("[OK] All verified table row counts match.");
+
+            if (discrepancies.Count == 0)
+                Log.Information("[OK] All verified table row counts match ({TenantCount} by tenant, {IdMappingCount} via IdMapping).", matchCount, idMappingMatchCount);
+            else
+                Log.Warning("[Validator] {DiscrepancyCount} discrepancy(ies) found. {MatchCount} by tenant matched, {IdMappingCount} via IdMapping matched.",
+                    discrepancies.Count, matchCount, idMappingMatchCount);
+
+            return (matchCount, idMappingMatchCount, discrepancies.Count);
         }
 
         private async Task ValidateForeignKeysAsync()
         {
-            Console.WriteLine("\n[2/3] Validating Foreign Keys in Target...");
+            Log.Information("\n[2/3] Validating Foreign Keys in Target...");
             using var target = new SqlConnection(_targetConnStr);
-            
+
             try
             {
-                // Simple DBCC check
-                var results = await target.QueryAsync("DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS");
+                // DBCC CHECKCONSTRAINTS can be very slow on large databases — use extended timeout
+                var results = await target.QueryAsync("DBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS",
+                    commandTimeout: 3600);
                 if (results.Any())
                 {
-                    Console.WriteLine("[ERROR] Foreign Key Violations Found:");
+                    Log.Error("[ERROR] Foreign Key Violations Found:");
                     foreach (var row in results)
                     {
-                        Console.WriteLine($" - Table: {row.Table}, Constraint: {row.Constraint}, Where: {row.Where}");
+                        Log.Error(" - Table: {Table}, Constraint: {Constraint}, Where: {Where}", row.Table, row.Constraint, row.Where);
+                        ReportWriter.AddFkViolation((string)row.Table, (string)row.Constraint, (string)row.Where);
                     }
                 }
                 else
                 {
-                    Console.WriteLine("[OK] No Foreign Key violations detected.");
+                    Log.Information("[OK] No Foreign Key violations detected.");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Error] FK Validation failed: {ex.Message}");
+                Log.Error("[Error] FK Validation failed: {ErrorMessage}", ex.Message);
             }
         }
 
-        private async Task ValidateBusinessLogicAsync(int tenantId)
+        private async Task ValidateBusinessLogicAsync(int targetTenantId)
         {
-            Console.WriteLine("\n[3/3] Running Business Validation Queries...");
+            Log.Information("\n[3/3] Running Business Validation Queries...");
             using var target = new SqlConnection(_targetConnStr);
 
-            // 1. Active Contacts
-            await RunCheck(target, "Active Contacts", 
-                $"SELECT COUNT(*) FROM Contact WHERE IsDeleted = 0 AND TenantID = {tenantId}");
+            // 1. Contact Count
+            await RunCheck(target, "Total Contacts",
+                "SELECT COUNT(*) FROM Contact WHERE TenantID = @TenantId",
+                new { TenantId = targetTenantId });
 
             // 2. Timeband Range
-            await RunCheck(target, "Timeband Schedule Range", 
-                $"SELECT 'Start: ' + CONVERT(varchar, MIN(ScheduleStart), 120) + ' End: ' + CONVERT(varchar, MAX(ScheduleEnd), 120) FROM Timeband WHERE TenantID = {tenantId}");
-            
+            await RunCheck(target, "Timeband Schedule Range",
+                "SELECT 'Start: ' + CONVERT(varchar(30), MIN(ScheduleStart), 120) + ' End: ' + CONVERT(varchar(30), MAX(ScheduleEnd), 120) FROM Timeband WHERE TenantId = @TenantId",
+                new { TenantId = targetTenantId });
+
             // 3. Leave Request Stats
-            await RunCheck(target, "Leave Requests by Status", 
-                $"SELECT 'Status ' + CAST(StatusID as varchar) + ': ' + CAST(COUNT(*) as varchar) FROM LeaveRequest WHERE TenantID = {tenantId} GROUP BY StatusID");
+            await RunCheck(target, "Leave Requests by Status",
+                "SELECT 'Status ' + CAST(StatusID as varchar(36)) + ': ' + CAST(COUNT(*) as varchar(20)) FROM LeaveRequest WHERE TenantID = @TenantId GROUP BY StatusID",
+                new { TenantId = targetTenantId });
         }
 
-        private async Task RunCheck(SqlConnection conn, string name, string sql)
+        private async Task RunCheck(SqlConnection conn, string name, string sql, object? param = null)
         {
-            try 
+            try
             {
-                // Check if table exists first?
-                // Or just try catch
-                var result = await conn.QueryAsync<string>(sql); // Assuming string output or simple scalar
-                // Actually result might be complex row.
-                // Let's print rows dynamic
-                
-                // If the user's query returns multiple columns/rows, QueryAsync<dynamic> is better
-                var rows = await conn.QueryAsync(sql);
-                
-                Console.WriteLine($"--- {name} ---");
+                var rows = await conn.QueryAsync(sql, param);
+
+                Log.Information("--- {Name} ---", name);
                 if (!rows.Any())
                 {
-                    Console.WriteLine("(No results)");
+                    Log.Information("(No results)");
                     return;
                 }
 
                 foreach (var row in rows)
                 {
-                   Console.WriteLine(row);
+                   Log.Information("{Row}", row);
                 }
             }
             catch(SqlException ex)
             {
-                // Table likely doesn't exist
-                // Console.WriteLine($"[Skip] {name}: Table missing or error ({ex.Message})");
+                Log.Warning("[Skip] {Name}: {ErrorMessage}", name, ex.Message);
             }
         }
     }

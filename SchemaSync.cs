@@ -1,8 +1,10 @@
 using Microsoft.Data.SqlClient;
 using Dapper;
+using Serilog;
 using System.Text;
 using System.IO;
 using System.Linq;
+using System.Diagnostics;
 
 namespace Logistics.DbMerger
 {
@@ -17,39 +19,85 @@ namespace Logistics.DbMerger
             _targetConnStr = targetConnStr;
         }
 
+        /// <summary>Escape single quotes for use in SQL string literals (WHERE name = '...').</summary>
+        private static string SqlEsc(string name) => name.Replace("'", "''");
+        /// <summary>Escape brackets for use in SQL bracket-delimited identifiers ([...]).</summary>
+        private static string BracketEsc(string name) => name.Replace("]", "]]");
+
         public async Task<List<string>> GetMissingTablesAsync()
         {
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
 
-            var sourceTables = await source.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'");
-            var targetTables = await target.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'");
+            var sourceTables = await source.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = 'dbo'");
+            var targetTables = await target.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = 'dbo'");
 
-            var missing = sourceTables.Except(targetTables, StringComparer.OrdinalIgnoreCase).ToList();
+            var missing = sourceTables
+                .Except(targetTables, StringComparer.OrdinalIgnoreCase)
+                .Where(t => !TableSkipRules.ShouldSkipTable(t))
+                .ToList();
             return missing;
         }
 
         public async Task SyncTableAsync(string tableName)
         {
-            var createScript = await GenerateCreateScriptAsync(tableName);
+            var sw = Stopwatch.StartNew();
             using var target = new SqlConnection(_targetConnStr);
-            
-            // Split by GO batch separator
-            var batches = System.Text.RegularExpressions.Regex.Split(createScript, @"^\s*GO\s*$", System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            // IF NOT EXISTS guard: check table existence before executing any batches
+            var alreadyExists = await target.QueryFirstOrDefaultAsync<int>(
+                "SELECT COUNT(*) FROM sys.tables WHERE name = @Name AND schema_id = SCHEMA_ID('dbo')",
+                new { Name = tableName });
+            if (alreadyExists > 0)
+            {
+                Log.Information("[Schema] Table already exists, skipping: {TableName}", tableName);
+                ReportWriter.AddSchemaTable(tableName, "Skipped", 0);
+                return;
+            }
+
+            var createScript = await GenerateCreateScriptAsync(tableName);
+
+            // Split by GO batch separator — matches GO on its own line only (no trailing text except optional semicolon)
+            // This avoids matching GO inside comments like "-- GO forward" or string literals
+            var batches = System.Text.RegularExpressions.Regex.Split(createScript, @"^\s*GO\s*;?\s*$", System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            bool anyBatchExecuted = false;
             foreach (var batch in batches)
             {
                 if (!string.IsNullOrWhiteSpace(batch))
-                    await target.ExecuteAsync(batch);
+                {
+                    try
+                    {
+                        await target.ExecuteAsync(batch);
+                        // H3: Log rollback entry on first successful batch so partial creates can be rolled back
+                        if (!anyBatchExecuted)
+                        {
+                            anyBatchExecuted = true;
+                            RollbackLogger.LogTableCreation(tableName);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "[Error] Failed batch for {TableName} (rollback entry exists if table was partially created)", tableName);
+                        throw;
+                    }
+                }
             }
 
-            Console.WriteLine($"[Schema] Created table {tableName} (with Constraints)");
-            RollbackLogger.LogTableCreation(tableName);
+            if (anyBatchExecuted)
+            {
+                Log.Information("[Schema] Created table {TableName} (with Constraints)", tableName);
+            }
+
+            sw.Stop();
+            Log.Information("[Schema] Synced table {TableName} in {ElapsedMs}ms", tableName, sw.ElapsedMilliseconds);
+            if (anyBatchExecuted)
+                ReportWriter.AddSchemaTable(tableName, "Created", sw.ElapsedMilliseconds);
         }
 
         private async Task<string> GenerateCreateScriptAsync(string tableName)
         {
             using var source = new SqlConnection(_sourceConnStr);
-            
+
             // 1. Fetch Columns with extended properties (Identity, Computed)
             // Join with sys.computed_columns to get definition if computed
             var columns = await source.QueryAsync<dynamic>(@"
@@ -118,7 +166,7 @@ namespace Logistics.DbMerger
                 INNER JOIN sys.columns c ON ic.column_id = c.column_id AND ic.object_id = c.object_id
                 WHERE ic.object_id = OBJECT_ID(@TableName)
                 ORDER BY ic.index_id, ic.key_ordinal", new { TableName = tableName });
-            
+
             var indexColLookup = indexCols.GroupBy(x => (int)x.index_id).ToDictionary(g => g.Key, g => g.ToList());
 
             var pkInfo = indexes.FirstOrDefault(i => i.is_primary_key == true);
@@ -128,7 +176,7 @@ namespace Logistics.DbMerger
             sb.AppendLine("GO");
             sb.AppendLine("SET QUOTED_IDENTIFIER ON");
             sb.AppendLine("GO");
-            sb.AppendLine($"CREATE TABLE [dbo].[{tableName}](");
+            sb.AppendLine($"CREATE TABLE [dbo].[{BracketEsc(tableName)}](");
 
             var colList = columns.ToList();
             bool hasLob = false;
@@ -136,11 +184,11 @@ namespace Logistics.DbMerger
             for (int i = 0; i < colList.Count; i++)
             {
                 var col = colList[i];
-                
+
                 // Computed Column
                 if (col.is_computed)
                 {
-                     sb.Append($"	[{col.ColumnName}] AS ({col.ComputedDefinition})");
+                    sb.Append($"	[{BracketEsc(col.ColumnName)}] AS ({col.ComputedDefinition})");
                 }
                 else
                 {
@@ -164,19 +212,20 @@ namespace Logistics.DbMerger
 
                     string identity = col.is_identity == true ? " IDENTITY(1,1)" : "";
                     string nullable = col.is_nullable == true ? " NULL" : " NOT NULL";
-                    
-                    sb.Append($"	[{col.ColumnName}] {typeDef}{identity}{nullable}");
-                    
+
+                    sb.Append($"	[{BracketEsc(col.ColumnName)}] {typeDef}{identity}{nullable}");
+
                     // Default Constraint
                     if (defaultDict.ContainsKey((int)col.column_id))
                     {
-                        string defName = $"DF_{tableName}_{col.ColumnName}"; 
-                        sb.Append($" CONSTRAINT [{defName}] DEFAULT {defaultDict[(int)col.column_id]}");
+                        var defNameRaw = $"DF_{tableName}_{col.ColumnName}";
+                        string defName = defNameRaw.Length > 128 ? defNameRaw.Substring(0, 128) : defNameRaw;
+                        sb.Append($" CONSTRAINT [{BracketEsc(defName)}] DEFAULT {defaultDict[(int)col.column_id]}");
                     }
                 }
-                
+
                 // Comma Logic
-                if (i < colList.Count - 1 || pkInfo != null || checks.Any()) 
+                if (i < colList.Count - 1 || pkInfo != null || checks.Any())
                     sb.AppendLine(",");
                 else
                     sb.AppendLine("");
@@ -185,19 +234,19 @@ namespace Logistics.DbMerger
             // Append PK with Options
             if (pkInfo != null)
             {
-                sb.AppendLine($" CONSTRAINT [{pkInfo.IndexName}] PRIMARY KEY {pkInfo.IndexType} ");
+                sb.AppendLine($" CONSTRAINT [{BracketEsc(pkInfo.IndexName)}] PRIMARY KEY {pkInfo.IndexType} ");
                 sb.AppendLine("(");
-                
+
                 var pkCols = indexColLookup.ContainsKey((int)pkInfo.index_id) ? indexColLookup[(int)pkInfo.index_id] : new List<dynamic>();
-                
-                for(int k=0; k<pkCols.Count; k++)
+
+                for (int k = 0; k < pkCols.Count; k++)
                 {
-                     var c = pkCols[k];
-                     sb.Append($"	[{c.ColumnName}] {(c.is_descending_key ? "DESC" : "ASC")}");
-                     if (k < pkCols.Count - 1) sb.Append(",");
-                     sb.AppendLine();
+                    var c = pkCols[k];
+                    sb.Append($"	[{BracketEsc(c.ColumnName)}] {(c.is_descending_key ? "DESC" : "ASC")}");
+                    if (k < pkCols.Count - 1) sb.Append(",");
+                    sb.AppendLine();
                 }
-                
+
                 // Construct Options
                 var opts = new List<string>();
                 opts.Add($"PAD_INDEX = {(pkInfo.is_padded == true ? "ON" : "OFF")}");
@@ -209,67 +258,67 @@ namespace Logistics.DbMerger
                 {
                     opts.Add($"FILLFACTOR = {pkInfo.fill_factor}");
                 }
-                
+
                 sb.Append($")WITH ({string.Join(", ", opts)}) ON [PRIMARY]");
-                
+
                 if (checks.Any()) sb.AppendLine(","); else sb.AppendLine("");
             }
 
             // Append Check Constraints
             var checkList = checks.ToList();
-            for(int c=0; c < checkList.Count; c++)
+            for (int c = 0; c < checkList.Count; c++)
             {
                 var chk = checkList[c];
-                sb.Append($"	CONSTRAINT [{chk.CheckName}] CHECK {chk.CheckDefinition}");
+                sb.Append($"	CONSTRAINT [{BracketEsc(chk.CheckName)}] CHECK {chk.CheckDefinition}");
                 if (c < checkList.Count - 1) sb.AppendLine(","); else sb.AppendLine("");
             }
 
             sb.Append(") ON [PRIMARY]");
-            if (hasLob) sb.Append(" TEXTIMAGE_ON [PRIMARY]"); 
-            
+            if (hasLob) sb.Append(" TEXTIMAGE_ON [PRIMARY]");
+
             sb.AppendLine("");
             sb.AppendLine("GO");
-            
+
             // Append Non-Clustered Indexes
-            foreach(var idx in indexes)
+            foreach (var idx in indexes)
             {
                 if (idx.is_primary_key == true) continue;
-                
+
                 string unique = idx.is_unique == true ? "UNIQUE " : "";
                 string type = idx.IndexType; // NONCLUSTERED
-                sb.AppendLine($"CREATE {unique}{type} INDEX [{idx.IndexName}] ON [dbo].[{tableName}]");
+                sb.AppendLine($"CREATE {unique}{type} INDEX [{BracketEsc(idx.IndexName)}] ON [dbo].[{BracketEsc(tableName)}]");
                 sb.Append("(");
-                
+
                 var cols = indexColLookup.ContainsKey((int)idx.index_id) ? indexColLookup[(int)idx.index_id] : new List<dynamic>();
                 var keyCols = cols.Where(x => x.is_included_column == false).ToList();
                 var incCols = cols.Where(x => x.is_included_column == true).ToList();
-                
-                for(int k=0; k<keyCols.Count; k++)
+
+                for (int k = 0; k < keyCols.Count; k++)
                 {
                     var c = keyCols[k];
-                    sb.Append($"[{c.ColumnName}] {(c.is_descending_key ? "DESC" : "ASC")}");
+                    sb.Append($"[{BracketEsc(c.ColumnName)}] {(c.is_descending_key ? "DESC" : "ASC")}");
                     if (k < keyCols.Count - 1) sb.Append(", ");
                 }
                 sb.Append(")");
-                
+
                 if (incCols.Any())
                 {
                     sb.AppendLine();
                     sb.Append("INCLUDE (");
-                    for(int k=0; k<incCols.Count; k++)
+                    for (int k = 0; k < incCols.Count; k++)
                     {
-                        sb.Append($"[{incCols[k].ColumnName}]");
+                        sb.Append($"[{BracketEsc(incCols[k].ColumnName)}]");
                         if (k < incCols.Count - 1) sb.Append(", ");
                     }
                     sb.Append(")");
                 }
-                
+
                 if (!string.IsNullOrEmpty(idx.filter_definition))
                 {
-                     sb.AppendLine();
-                     sb.Append($"WHERE {idx.filter_definition}");
+                    sb.AppendLine();
+                    sb.Append($"WHERE {idx.filter_definition}");
                 }
-                
+
                 sb.AppendLine(" WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]");
                 sb.AppendLine("GO");
             }
@@ -279,14 +328,14 @@ namespace Logistics.DbMerger
 
         public async Task<List<string>> GetExistingTargetTablesAsync()
         {
-             using var target = new SqlConnection(_targetConnStr);
-             return (await target.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'")).ToList();
+            using var target = new SqlConnection(_targetConnStr);
+            return (await target.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = 'dbo'")).ToList();
         }
 
         public async Task<List<string>> GetExistingSourceTablesAsync()
         {
-             using var source = new SqlConnection(_sourceConnStr);
-             return (await source.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'")).ToList();
+            using var source = new SqlConnection(_sourceConnStr);
+            return (await source.QueryAsync<string>("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = 'dbo'")).ToList();
         }
 
         public async Task<List<dynamic>> GetRequiredColumnsAsync(string tableName)
@@ -306,54 +355,60 @@ namespace Logistics.DbMerger
             foreach (var col in newColumns)
             {
                 string typeDef = $"{col.DATA_TYPE}";
-                 if (col.DATA_TYPE == "nvarchar" || col.DATA_TYPE == "varchar" || col.DATA_TYPE == "char" || col.DATA_TYPE == "nchar" || col.DATA_TYPE == "varbinary")
+                if (col.DATA_TYPE == "nvarchar" || col.DATA_TYPE == "varchar" || col.DATA_TYPE == "char" || col.DATA_TYPE == "nchar" || col.DATA_TYPE == "varbinary" || col.DATA_TYPE == "binary")
                 {
                     string len = col.CHARACTER_MAXIMUM_LENGTH == -1 ? "MAX" : col.CHARACTER_MAXIMUM_LENGTH.ToString();
                     typeDef += $"({len})";
                 }
                 else if (col.DATA_TYPE == "decimal" || col.DATA_TYPE == "numeric")
                 {
-                     typeDef += $"({col.NUMERIC_PRECISION}, {col.NUMERIC_SCALE})";
+                    typeDef += $"({col.NUMERIC_PRECISION}, {col.NUMERIC_SCALE})";
                 }
-                
-                // Allow NULL for new columns to be safe for existing data? 
-                // Or follow source? If source says NOT NULL, we must provide default.
-                // For simplified merge, we'll force NULL usually, OR trust the source but we might fail if table has rows.
-                // Safer: ADD COLUMN ... NULL
-                string definition = $"ALTER TABLE [{tableName}] ADD [{col.COLUMN_NAME}] {typeDef} NULL"; 
-                
-                Console.WriteLine($"[Schema] Altering {tableName}: Adding {col.COLUMN_NAME}");
+
+                // IF NOT EXISTS guard for idempotent re-runs
+                var colExistsAlready = await target.QueryFirstOrDefaultAsync<int>(
+                    "SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID(@Table) AND name = @Col",
+                    new { Table = $"[dbo].[{tableName}]", Col = (string)col.COLUMN_NAME });
+                if (colExistsAlready > 0)
+                {
+                    continue;
+                }
+
+                // Respect source nullability: if source says NOT NULL, still add as NULL
+                // because target table may have existing rows that need a default value.
+                // Adding NOT NULL without a default would fail on tables with existing data.
+                string nullable = "NULL";
+                string definition = $"ALTER TABLE [{BracketEsc(tableName)}] ADD [{BracketEsc(col.COLUMN_NAME)}] {typeDef} {nullable}";
+
+                Log.Information("[Schema] Altering {TableName}: Adding {ColumnName}", tableName, col.COLUMN_NAME);
                 await target.ExecuteAsync(definition);
-                
+                ReportWriter.AddSchemaColumn(tableName, col.COLUMN_NAME);
+
                 // Log Rollback (Drop Column)
                 // Note: RollbackLogger needs update or we just use raw SQL string
                 // Dropping a column is: ALTER TABLE x DROP COLUMN y
                 // We'll append manually for now or add helper.
-                string rollback = $"IF EXISTS(SELECT * FROM sys.columns WHERE Name = N'{col.COLUMN_NAME}' AND Object_ID = Object_ID(N'dbo.{tableName}')) ALTER TABLE dbo.{tableName} DROP COLUMN [{col.COLUMN_NAME}];\n";
-                using (var sw = File.AppendText($"rollback_{DateTime.Now:yyyyMMdd_HHmmss}.sql")) // This creates a NEW file every time? No, need consistent filename.
-                {
-                    // RollbackLogger static path usage is better.
-                    // We need to expose a bespoke logging method.
-                }
+                string rollback = $"IF EXISTS(SELECT * FROM sys.columns WHERE Name = N'{SqlEsc(col.COLUMN_NAME)}' AND Object_ID = Object_ID(N'dbo.{SqlEsc(tableName)}')) ALTER TABLE [dbo].[{BracketEsc(tableName)}] DROP COLUMN [{BracketEsc(col.COLUMN_NAME)}];\n";
                 RollbackLogger.LogCustomScript(rollback);
             }
         }
 
         public async Task SyncTableSchemaAsync(string sourceTable, string targetTable, bool dryRun = false)
         {
+            var sw = Stopwatch.StartNew();
             var sourceCols = await GetRequiredColumnsAsync(sourceTable);
-            
+
             using var target = new SqlConnection(_targetConnStr);
             var targetCols = (await target.QueryAsync<string>("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @Name", new { Name = targetTable })).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             var missingCols = sourceCols.Where(c => !targetCols.Contains((string)c.COLUMN_NAME)).ToList();
-            
+
             if (missingCols.Any())
             {
                 if (dryRun)
                 {
-                     foreach(var col in missingCols) 
-                        Console.WriteLine($"[DryRun] Would Add Column: {targetTable}.{col.COLUMN_NAME}");
+                    foreach (var col in missingCols)
+                        Log.Information("[DryRun] Would Add Column: {TargetTable}.{ColumnName}", targetTable, col.COLUMN_NAME);
                 }
                 else
                 {
@@ -366,22 +421,30 @@ namespace Logistics.DbMerger
                 // Console.WriteLine($"[Schema] No new columns to add for {targetTable}");
             }
             */
+
+            sw.Stop();
+            if (sw.ElapsedMilliseconds > 100)
+                Log.Information("[Schema] Column sync for {TargetTable} in {ElapsedMs}ms", targetTable, sw.ElapsedMilliseconds);
         }
 
         public async Task SyncAllConstraintsAsync(Dictionary<string, string> tableMappings, bool dryRun)
         {
-            Console.WriteLine("\n=== [Post-Table] Constraint & Partition Sync ===");
+            var sw = Stopwatch.StartNew();
+            Log.Information("\n=== [Post-Table] Constraint & Partition Sync ===");
             await SyncDefaultConstraintsAsync(tableMappings, dryRun);
             await SyncCheckConstraintsAsync(tableMappings, dryRun);
             await SyncIndexesAsync(tableMappings, dryRun);
             await SyncForeignKeysAsync(tableMappings, dryRun);
             await SyncPartitionsAsync(dryRun);
-            Console.WriteLine("=== [Post-Table] Constraint Sync Complete ===\n");
+            Log.Information("=== [Post-Table] Constraint Sync Complete ===\n");
+
+            sw.Stop();
+            Log.Information("[Schema] Constraint sync completed in {ElapsedMs}ms", sw.ElapsedMilliseconds);
         }
 
         public async Task SyncForeignKeysAsync(Dictionary<string, string> tableMappings, bool dryRun)
         {
-            Console.WriteLine("\n[Constraints] Syncing Foreign Keys...");
+            Log.Information("\n[Constraints] Syncing Foreign Keys...");
 
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
@@ -459,23 +522,28 @@ namespace Logistics.DbMerger
 
                 if (!valid)
                 {
-                    Console.WriteLine($"[FK] Skipping {fkName}: columns missing in target");
+                    Log.Information("[FK] Skipping {FkName}: columns missing in target", fkName);
                     skipped++;
                     continue;
                 }
 
-                var parentColList = string.Join(", ", cols.Select(c => $"[{(string)c.ParentColumn}]"));
-                var refColList = string.Join(", ", cols.Select(c => $"[{(string)c.ReferencedColumn}]"));
+                var parentColList = string.Join(", ", cols.Select(c => $"[{BracketEsc((string)c.ParentColumn)}]"));
+                var refColList = string.Join(", ", cols.Select(c => $"[{BracketEsc((string)c.ReferencedColumn)}]"));
                 string deleteAction = ((string)fk.DeleteAction).Replace("_", " ");
                 string updateAction = ((string)fk.UpdateAction).Replace("_", " ");
 
-                string sql = $"ALTER TABLE [dbo].[{targetParent}] ADD CONSTRAINT [{fkName}] " +
-                    $"FOREIGN KEY ({parentColList}) REFERENCES [dbo].[{targetRef}] ({refColList}) " +
-                    $"ON DELETE {deleteAction} ON UPDATE {updateAction}";
+                // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                var fkNameEsc = fkName.Replace("'", "''");
+                var fkNameBracket = fkName.Replace("]", "]]");
+                var targetParentBracket = targetParent.Replace("]", "]]");
+                var targetRefBracket = targetRef.Replace("]", "]]");
+                string sql = $@"
+IF NOT EXISTS (SELECT * FROM sys.foreign_keys WHERE name = N'{fkNameEsc}')
+    ALTER TABLE [dbo].[{targetParentBracket}] ADD CONSTRAINT [{fkNameBracket}] FOREIGN KEY ({parentColList}) REFERENCES [dbo].[{targetRefBracket}] ({refColList}) ON DELETE {deleteAction} ON UPDATE {updateAction}";
 
                 if (dryRun)
                 {
-                    Console.WriteLine($"[DryRun] Would create FK: {fkName} ({targetParent} -> {targetRef})");
+                    Log.Information("[DryRun] Would create FK: {FkName} ({TargetParent} -> {TargetRef})", fkName, targetParent, targetRef);
                     created++;
                 }
                 else
@@ -483,25 +551,26 @@ namespace Logistics.DbMerger
                     try
                     {
                         await target.ExecuteAsync(sql);
-                        Console.WriteLine($"[FK] Created: {fkName} ({targetParent} -> {targetRef})");
+                        Log.Information("[FK] Created: {FkName} ({TargetParent} -> {TargetRef})", fkName, targetParent, targetRef);
                         RollbackLogger.LogCustomScript(
-                            $"IF OBJECT_ID('{fkName}', 'F') IS NOT NULL ALTER TABLE [dbo].[{targetParent}] DROP CONSTRAINT [{fkName}];\n");
+                            $"IF OBJECT_ID(N'{fkNameEsc}', 'F') IS NOT NULL ALTER TABLE [dbo].[{targetParentBracket}] DROP CONSTRAINT [{fkNameBracket}];\n");
                         created++;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[FK] Failed {fkName}: {ex.Message}");
+                        Log.Error("[FK] Failed {FkName}: {ErrorMessage}", fkName, ex.Message);
                         failed++;
                     }
                 }
             }
 
-            Console.WriteLine($"[FK] Summary: {created} created, {skipped} skipped, {failed} failed");
+            Log.Information("[FK] Summary: {Created} created, {Skipped} skipped, {Failed} failed", created, skipped, failed);
+            ReportWriter.AddSchemaConstraint("Foreign Keys", created, skipped, failed);
         }
 
         public async Task SyncIndexesAsync(Dictionary<string, string> tableMappings, bool dryRun)
         {
-            Console.WriteLine("\n[Constraints] Syncing Indexes & Unique Constraints...");
+            Log.Information("\n[Constraints] Syncing Indexes & Unique Constraints...");
 
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
@@ -600,21 +669,27 @@ namespace Logistics.DbMerger
 
                 if (isUniqueConstraint)
                 {
-                    var keyColStr = string.Join(", ", keyCols.Select(c => $"[{(string)c.ColumnName}]"));
-                    sql = $"ALTER TABLE [dbo].[{targetTable}] ADD CONSTRAINT [{indexName}] UNIQUE ({keyColStr})";
+                    var keyColStr = string.Join(", ", keyCols.Select(c => $"[{BracketEsc((string)c.ColumnName)}]"));
+                    // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                    sql = $@"
+IF NOT EXISTS (SELECT * FROM sys.key_constraints WHERE name = '{SqlEsc(indexName)}' AND type = 'UQ' AND parent_object_id = OBJECT_ID('[dbo].[{BracketEsc(targetTable)}]'))
+    ALTER TABLE [dbo].[{BracketEsc(targetTable)}] ADD CONSTRAINT [{BracketEsc(indexName)}] UNIQUE ({keyColStr})";
                 }
                 else
                 {
                     string unique = idx.is_unique == true ? "UNIQUE " : "";
                     string type = idx.IndexType;
                     var keyColStr = string.Join(", ", keyCols.Select(c =>
-                        $"[{(string)c.ColumnName}] {((bool)c.is_descending_key ? "DESC" : "ASC")}"));
+                        $"[{BracketEsc((string)c.ColumnName)}] {((bool)c.is_descending_key ? "DESC" : "ASC")}"));
 
-                    sql = $"CREATE {unique}{type} INDEX [{indexName}] ON [dbo].[{targetTable}] ({keyColStr})";
+                    // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                    sql = $@"
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = '{SqlEsc(indexName)}' AND object_id = OBJECT_ID('[dbo].[{BracketEsc(targetTable)}]'))
+    CREATE {unique}{type} INDEX [{BracketEsc(indexName)}] ON [dbo].[{BracketEsc(targetTable)}] ({keyColStr})";
 
                     if (incCols.Any())
                     {
-                        var incColStr = string.Join(", ", incCols.Select(c => $"[{(string)c.ColumnName}]"));
+                        var incColStr = string.Join(", ", incCols.Select(c => $"[{BracketEsc((string)c.ColumnName)}]"));
                         sql += $" INCLUDE ({incColStr})";
                     }
 
@@ -633,7 +708,7 @@ namespace Logistics.DbMerger
 
                 if (dryRun)
                 {
-                    Console.WriteLine($"[DryRun] Would create {(isUniqueConstraint ? "unique constraint" : "index")}: {indexName} on {targetTable}");
+                    Log.Information("[DryRun] Would create {IndexType}: {IndexName} on {TargetTable}", isUniqueConstraint ? "unique constraint" : "index", indexName, targetTable);
                     created++;
                 }
                 else
@@ -641,29 +716,30 @@ namespace Logistics.DbMerger
                     try
                     {
                         await target.ExecuteAsync(sql);
-                        Console.WriteLine($"[Index] Created: {indexName} on {targetTable}");
+                        Log.Information("[Index] Created: {IndexName} on {TargetTable}", indexName, targetTable);
                         if (isUniqueConstraint)
                             RollbackLogger.LogCustomScript(
-                                $"IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = '{indexName}' AND type = 'UQ') ALTER TABLE [dbo].[{targetTable}] DROP CONSTRAINT [{indexName}];\n");
+                                $"IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = '{SqlEsc(indexName)}' AND type = 'UQ') ALTER TABLE [dbo].[{BracketEsc(targetTable)}] DROP CONSTRAINT [{BracketEsc(indexName)}];\n");
                         else
                             RollbackLogger.LogCustomScript(
-                                $"IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{indexName}') DROP INDEX [{indexName}] ON [dbo].[{targetTable}];\n");
+                                $"IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{SqlEsc(indexName)}') DROP INDEX [{BracketEsc(indexName)}] ON [dbo].[{BracketEsc(targetTable)}];\n");
                         created++;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[Index] Failed {indexName}: {ex.Message}");
+                        Log.Error("[Index] Failed {IndexName}: {ErrorMessage}", indexName, ex.Message);
                         failed++;
                     }
                 }
             }
 
-            Console.WriteLine($"[Index] Summary: {created} created, {skipped} skipped, {failed} failed");
+            Log.Information("[Index] Summary: {Created} created, {Skipped} skipped, {Failed} failed", created, skipped, failed);
+            ReportWriter.AddSchemaConstraint("Indexes", created, skipped, failed);
         }
 
         public async Task SyncCheckConstraintsAsync(Dictionary<string, string> tableMappings, bool dryRun)
         {
-            Console.WriteLine("\n[Constraints] Syncing Check Constraints...");
+            Log.Information("\n[Constraints] Syncing Check Constraints...");
 
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
@@ -699,11 +775,14 @@ namespace Logistics.DbMerger
                 if (targetCheckNames.Contains(name))
                     continue;
 
-                string sql = $"ALTER TABLE [dbo].[{targetTable}] ADD CONSTRAINT [{name}] CHECK {definition}";
+                // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                string sql = $@"
+IF NOT EXISTS (SELECT * FROM sys.check_constraints WHERE name = '{SqlEsc(name)}')
+    ALTER TABLE [dbo].[{BracketEsc(targetTable)}] ADD CONSTRAINT [{BracketEsc(name)}] CHECK {definition}";
 
                 if (dryRun)
                 {
-                    Console.WriteLine($"[DryRun] Would create check: {name} on {targetTable}");
+                    Log.Information("[DryRun] Would create check: {Name} on {TargetTable}", name, targetTable);
                     created++;
                 }
                 else
@@ -711,25 +790,26 @@ namespace Logistics.DbMerger
                     try
                     {
                         await target.ExecuteAsync(sql);
-                        Console.WriteLine($"[Check] Created: {name} on {targetTable}");
+                        Log.Information("[Check] Created: {Name} on {TargetTable}", name, targetTable);
                         RollbackLogger.LogCustomScript(
-                            $"IF OBJECT_ID('{name}', 'C') IS NOT NULL ALTER TABLE [dbo].[{targetTable}] DROP CONSTRAINT [{name}];\n");
+                            $"IF OBJECT_ID('{SqlEsc(name)}', 'C') IS NOT NULL ALTER TABLE [dbo].[{BracketEsc(targetTable)}] DROP CONSTRAINT [{BracketEsc(name)}];\n");
                         created++;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[Check] Failed {name}: {ex.Message}");
+                        Log.Error("[Check] Failed {Name}: {ErrorMessage}", name, ex.Message);
                         failed++;
                     }
                 }
             }
 
-            Console.WriteLine($"[Check] Summary: {created} created, {skipped} skipped, {failed} failed");
+            Log.Information("[Check] Summary: {Created} created, {Skipped} skipped, {Failed} failed", created, skipped, failed);
+            ReportWriter.AddSchemaConstraint("Check Constraints", created, skipped, failed);
         }
 
         public async Task SyncDefaultConstraintsAsync(Dictionary<string, string> tableMappings, bool dryRun)
         {
-            Console.WriteLine("\n[Constraints] Syncing Default Constraints...");
+            Log.Information("\n[Constraints] Syncing Default Constraints...");
 
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
@@ -794,11 +874,14 @@ namespace Logistics.DbMerger
                 if (!targetColsByTable.TryGetValue(targetTable, out var cols) || !cols.Contains(colName))
                 { skipped++; continue; }
 
-                string sql = $"ALTER TABLE [dbo].[{targetTable}] ADD CONSTRAINT [{name}] DEFAULT {defaultVal} FOR [{colName}]";
+                // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                string sql = $@"
+IF NOT EXISTS (SELECT * FROM sys.default_constraints WHERE name = '{SqlEsc(name)}')
+    ALTER TABLE [dbo].[{BracketEsc(targetTable)}] ADD CONSTRAINT [{BracketEsc(name)}] DEFAULT {defaultVal} FOR [{BracketEsc(colName)}]";
 
                 if (dryRun)
                 {
-                    Console.WriteLine($"[DryRun] Would create default: {name} on {targetTable}.{colName}");
+                    Log.Information("[DryRun] Would create default: {Name} on {TargetTable}.{ColumnName}", name, targetTable, colName);
                     created++;
                 }
                 else
@@ -806,25 +889,26 @@ namespace Logistics.DbMerger
                     try
                     {
                         await target.ExecuteAsync(sql);
-                        Console.WriteLine($"[Default] Created: {name} on {targetTable}.{colName}");
+                        Log.Information("[Default] Created: {Name} on {TargetTable}.{ColumnName}", name, targetTable, colName);
                         RollbackLogger.LogCustomScript(
-                            $"IF OBJECT_ID('{name}', 'D') IS NOT NULL ALTER TABLE [dbo].[{targetTable}] DROP CONSTRAINT [{name}];\n");
+                            $"IF OBJECT_ID('{SqlEsc(name)}', 'D') IS NOT NULL ALTER TABLE [dbo].[{BracketEsc(targetTable)}] DROP CONSTRAINT [{BracketEsc(name)}];\n");
                         created++;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[Default] Failed {name}: {ex.Message}");
+                        Log.Error("[Default] Failed {Name}: {ErrorMessage}", name, ex.Message);
                         failed++;
                     }
                 }
             }
 
-            Console.WriteLine($"[Default] Summary: {created} created, {skipped} skipped, {failed} failed");
+            Log.Information("[Default] Summary: {Created} created, {Skipped} skipped, {Failed} failed", created, skipped, failed);
+            ReportWriter.AddSchemaConstraint("Defaults", created, skipped, failed);
         }
 
         public async Task SyncPartitionsAsync(bool dryRun)
         {
-            Console.WriteLine("\n[Constraints] Checking Partitions...");
+            Log.Information("\n[Constraints] Checking Partitions...");
 
             using var source = new SqlConnection(_sourceConnStr);
             using var target = new SqlConnection(_targetConnStr);
@@ -845,7 +929,7 @@ namespace Logistics.DbMerger
 
             if (!sourcePFs.Any())
             {
-                Console.WriteLine("[Partitions] No partition functions in source.");
+                Log.Information("[Partitions] No partition functions in source.");
             }
             else
             {
@@ -860,7 +944,7 @@ namespace Logistics.DbMerger
 
                     if (targetPFNames.Contains(pfName))
                     {
-                        Console.WriteLine($"[Partitions] Function '{pfName}' already exists.");
+                        Log.Information("[Partitions] Function '{FunctionName}' already exists.", pfName);
                         continue;
                     }
 
@@ -893,11 +977,14 @@ namespace Logistics.DbMerger
                     });
                     string valuesStr = string.Join(", ", boundaryValues);
 
-                    string createPF = $"CREATE PARTITION FUNCTION [{pfName}] ({typeDef}) AS RANGE {range} FOR VALUES ({valuesStr})";
+                    // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                    string createPF = $@"
+IF NOT EXISTS (SELECT * FROM sys.partition_functions WHERE name = '{SqlEsc(pfName)}')
+    CREATE PARTITION FUNCTION [{BracketEsc(pfName)}] ({typeDef}) AS RANGE {range} FOR VALUES ({valuesStr})";
 
                     if (dryRun)
                     {
-                        Console.WriteLine($"[DryRun] Would create partition function: {pfName}");
+                        Log.Information("[DryRun] Would create partition function: {FunctionName}", pfName);
                         pfCreated++;
                     }
                     else
@@ -905,20 +992,21 @@ namespace Logistics.DbMerger
                         try
                         {
                             await target.ExecuteAsync(createPF);
-                            Console.WriteLine($"[Partitions] Created function: {pfName}");
+                            Log.Information("[Partitions] Created function: {FunctionName}", pfName);
                             RollbackLogger.LogCustomScript(
-                                $"IF EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = '{pfName}') DROP PARTITION FUNCTION [{pfName}];\n");
+                                $"IF EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = '{SqlEsc(pfName)}') DROP PARTITION FUNCTION [{BracketEsc(pfName)}];\n");
                             pfCreated++;
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[Partitions] Failed function {pfName}: {ex.Message}");
+                            Log.Error("[Partitions] Failed function {FunctionName}: {ErrorMessage}", pfName, ex.Message);
                             pfFailed++;
                         }
                     }
                 }
 
-                Console.WriteLine($"[Partitions] Functions: {pfCreated} created, {pfFailed} failed");
+                Log.Information("[Partitions] Functions: {Created} created, {Failed} failed", pfCreated, pfFailed);
+                ReportWriter.AddSchemaConstraint("Partition Functions", pfCreated, 0, pfFailed);
             }
 
             var sourceSchemes = await source.QueryAsync<dynamic>(@"
@@ -934,7 +1022,7 @@ namespace Logistics.DbMerger
 
             if (!sourceSchemes.Any())
             {
-                Console.WriteLine("[Partitions] No partition schemes in source.");
+                Log.Information("[Partitions] No partition schemes in source.");
             }
             else
             {
@@ -954,7 +1042,7 @@ namespace Logistics.DbMerger
 
                     if (targetSchemeNames.Contains(schemeName))
                     {
-                        Console.WriteLine($"[Partitions] Scheme '{schemeName}' already exists.");
+                        Log.Information("[Partitions] Scheme '{SchemeName}' already exists.", schemeName);
                         continue;
                     }
 
@@ -965,18 +1053,21 @@ namespace Logistics.DbMerger
                         string fg = (string)g.FileGroupName;
                         if (!targetFileGroups.Contains(fg))
                         {
-                            Console.WriteLine($"[Partitions] Filegroup '{fg}' missing in target, mapping to [PRIMARY]");
+                            Log.Warning("[PreFlight] Remapped partition filegroup '{FileGroup}' to PRIMARY (not found in target)", fg);
                             return "[PRIMARY]";
                         }
-                        return $"[{fg}]";
+                        return $"[{BracketEsc(fg)}]";
                     });
 
                     string fgList = string.Join(", ", fileGroups);
-                    string createPS = $"CREATE PARTITION SCHEME [{schemeName}] AS PARTITION [{funcName}] TO ({fgList})";
+                    // IF NOT EXISTS guard for idempotent re-runs (defense-in-depth alongside HashSet check)
+                    string createPS = $@"
+IF NOT EXISTS (SELECT * FROM sys.partition_schemes WHERE name = '{SqlEsc(schemeName)}')
+    CREATE PARTITION SCHEME [{BracketEsc(schemeName)}] AS PARTITION [{BracketEsc(funcName)}] TO ({fgList})";
 
                     if (dryRun)
                     {
-                        Console.WriteLine($"[DryRun] Would create partition scheme: {schemeName}");
+                        Log.Information("[DryRun] Would create partition scheme: {SchemeName}", schemeName);
                         psCreated++;
                     }
                     else
@@ -984,20 +1075,21 @@ namespace Logistics.DbMerger
                         try
                         {
                             await target.ExecuteAsync(createPS);
-                            Console.WriteLine($"[Partitions] Created scheme: {schemeName}");
+                            Log.Information("[Partitions] Created scheme: {SchemeName}", schemeName);
                             RollbackLogger.LogCustomScript(
-                                $"IF EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = '{schemeName}') DROP PARTITION SCHEME [{schemeName}];\n");
+                                $"IF EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = '{SqlEsc(schemeName)}') DROP PARTITION SCHEME [{BracketEsc(schemeName)}];\n");
                             psCreated++;
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[Partitions] Failed scheme {schemeName}: {ex.Message}");
+                            Log.Error("[Partitions] Failed scheme {SchemeName}: {ErrorMessage}", schemeName, ex.Message);
                             psFailed++;
                         }
                     }
                 }
 
-                Console.WriteLine($"[Partitions] Schemes: {psCreated} created, {psFailed} failed");
+                Log.Information("[Partitions] Schemes: {Created} created, {Failed} failed", psCreated, psFailed);
+                ReportWriter.AddSchemaConstraint("Partition Schemes", psCreated, 0, psFailed);
             }
 
             var partitionedTables = await source.QueryAsync<dynamic>(@"
@@ -1016,12 +1108,12 @@ namespace Logistics.DbMerger
 
             if (partitionedTables.Any())
             {
-                Console.WriteLine("\n[Partitions] Partitioned Tables in Source:");
+                Log.Information("\n[Partitions] Partitioned Tables in Source:");
                 foreach (var pt in partitionedTables)
                 {
-                    Console.WriteLine($"   {pt.TableName} -> Scheme: {pt.SchemeName}, Function: {pt.FunctionName}, Partitions: {pt.PartitionCount}");
+                    Log.Information("   {TableName} -> Scheme: {SchemeName}, Function: {FunctionName}, Partitions: {PartitionCount}", pt.TableName, pt.SchemeName, pt.FunctionName, pt.PartitionCount);
                 }
-                Console.WriteLine("[Partitions] Note: Table-level partition assignment requires index rebuild and should be reviewed manually.");
+                Log.Information("[Partitions] Note: Table-level partition assignment requires index rebuild and should be reviewed manually.");
             }
         }
     }

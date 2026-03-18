@@ -1,6 +1,8 @@
 using System.Data;
+using System.Diagnostics;
 using Microsoft.Data.SqlClient;
 using Dapper;
+using Serilog;
 
 namespace Logistics.DbMerger
 {
@@ -49,12 +51,15 @@ namespace Logistics.DbMerger
             ["ExcludeFromNotifications"] = (object)false,
             ["Order"] = (object)0, // sort/display order (ADC-only, NOT NULL)
             ["Type"] = (object)0, // Qualification.Type etc. (ADC-only, NOT NULL)
-            ["CreationTime"] = (object)default(DateTime), // ADC-only, NOT NULL -> SYSDATETIME()
+            ["CreationTime"] = (object)"__USE_DATETIME_NOW__", // Sentinel: resolved to DateTime.UtcNow at call time (SQL path uses SYSDATETIME())
             ["MandatoryQualification"] = (object)false, // Contact. ADC-only, bit NOT NULL
             ["TeamMemberBreakGroup"] = (object)false, // Settings. ADC-only, bit NOT NULL
             ["UKGPunchIntegration"] = (object)false, // Settings. ADC-only, bit NOT NULL
             // Other NOT NULL ADC-only columns use type-based default when targetCol is provided
         };
+
+        /// <summary>Cumulative row count across all Migrate* calls on this instance. Read from caller for summary.</summary>
+        public long TotalRowsMigrated { get; private set; }
 
         public DataMigrator(string sourceConnStr, string targetConnStr, int batchSize = 5000)
         {
@@ -147,13 +152,13 @@ namespace Logistics.DbMerger
             }).ToList();
         }
 
-        private async Task<bool> HasIdentityColumnAsync(SqlConnection conn, string tableName)
+        private async Task<bool> HasIdentityColumnAsync(SqlConnection conn, string tableName, SqlTransaction? transaction = null)
         {
             var fullName = "dbo." + tableName;
             var count = await conn.ExecuteScalarAsync<int>(@"
-                SELECT COUNT(*) 
-                FROM sys.identity_columns 
-                WHERE object_id = OBJECT_ID(@TableName)", new { TableName = fullName });
+                SELECT COUNT(*)
+                FROM sys.identity_columns
+                WHERE object_id = OBJECT_ID(@TableName)", new { TableName = fullName }, transaction: transaction);
             return count > 0;
         }
 
@@ -183,7 +188,8 @@ namespace Logistics.DbMerger
         public async Task MigrateTableAsync(string sourceTableName, bool isNewTable, string? targetTableName = null, int? sourceTenantId = null, int? targetTenantId = null, Dictionary<long, long>? userMapping = null, SqlConnection? externalSourceConn = null, SqlConnection? externalTargetConn = null)
         {
             string destTable = targetTableName ?? sourceTableName;
-            Console.WriteLine($"[Data] Migrating {sourceTableName} -> {destTable}...");
+            Log.Information("[Data] Migrating {SourceTable} -> {DestTable}...", sourceTableName, destTable);
+            var sw = Stopwatch.StartNew();
 
             var ownSource = externalSourceConn == null;
             var ownTarget = externalTargetConn == null;
@@ -202,12 +208,12 @@ namespace Logistics.DbMerger
 
             if (sourceTenantId.HasValue && hasTenantId)
             {
-                whereClause = $" WHERE TenantId = {sourceTenantId.Value}";
-                Console.WriteLine($"   -> Filtering by TenantId = {sourceTenantId.Value}");
+                whereClause = " WHERE TenantId = @TenantId";
+                Log.Information("   -> Filtering by TenantId = {SourceTenantId}", sourceTenantId.Value);
             }
             else if (sourceTenantId.HasValue && !hasTenantId)
             {
-                Console.WriteLine("   -> Table has no TenantId. Migrating ALL rows (Global/System Table).");
+                Log.Information("   -> Table has no TenantId. Migrating ALL rows (Global/System Table).");
             }
 
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
@@ -232,11 +238,16 @@ namespace Logistics.DbMerger
             bool hasTargetBinaryCols = targetColsWithDefault.Any(t => IsBinaryType(t.Schema.DataType));
 
             if (adcOnlyCols.Count > 0)
-                Console.WriteLine($"   -> ADC-only columns: {adcOnlyCols.Count} (will set defaults)");
+                Log.Information("   -> ADC-only columns: {AdcOnlyCount} (will set defaults)", adcOnlyCols.Count);
             if (typeMismatchColNames.Count > 0)
-                Console.WriteLine($"   -> Type-mismatch columns: {typeMismatchColNames.Count} (will convert)");
+                Log.Information("   -> Type-mismatch columns: {TypeMismatchCount} (will convert)", typeMismatchColNames.Count);
             if (stringLengthTruncateCols.Count > 0)
-                Console.WriteLine($"   -> String length truncation: {stringLengthTruncateCols.Count} column(s) (target shorter than source)");
+                Log.Information("   -> String length truncation: {TruncateCount} column(s) (target shorter than source)", stringLengthTruncateCols.Count);
+
+            // Guard Contact hardcoded defaults: only append if columns are truly ADC-only (not already detected)
+            bool needContactDefaults = sourceTableName.Equals("Contact", StringComparison.OrdinalIgnoreCase)
+                && adcOnlyCols.Count == 0 && typeMismatchColNames.Count == 0
+                && !sourceColNames.Contains("OldSAPID");
 
             string selectSql;
             if (adcOnlyCols.Count > 0 || typeMismatchColNames.Count > 0)
@@ -246,38 +257,45 @@ namespace Logistics.DbMerger
             else
             {
                 selectSql = "SELECT *";
-                if (sourceTableName.Equals("Contact", StringComparison.OrdinalIgnoreCase))
+                if (needContactDefaults)
                     selectSql += ", NULL as OldSAPID, 0 as PartTimeFlex, NULL as FobNumber, 0 as ExcludeOvertime, NULL as ExcludeOvertimeComment, 0 as VisaRestriction, NULL as VisaEndDate, NULL as MaximumHoursByFortnight, NULL as RosterProfile, 0 as ExcludeFromNotifications, 0 as MandatoryQualification";
-                selectSql += $" FROM [{sourceTableName}]{whereClause}";
+                selectSql += $" FROM [{sourceTableName.Replace("]", "]]")}]{whereClause}";
             }
 
             using var cmd = new SqlCommand(selectSql, sourceConn);
             cmd.CommandTimeout = 600;
+            if (sourceTenantId.HasValue && hasTenantId)
+                cmd.Parameters.AddWithValue("@TenantId", sourceTenantId.Value);
             
             using var reader = await cmd.ExecuteReaderAsync();
 
+            // Begin external transaction for per-table rollback safety (FR24, NFR6)
+            using var transaction = targetConn.BeginTransaction();
+            try
+            {
             using var bulkCopy = new SqlBulkCopy(targetConn,
-                hasIdentity? SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.TableLock : SqlBulkCopyOptions.TableLock,
-                null);
+                hasIdentity ? SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.CheckConstraints : SqlBulkCopyOptions.CheckConstraints,
+                transaction);
 
             bulkCopy.DestinationTableName = destTable;
             bulkCopy.BatchSize = _batchSize;
             bulkCopy.BulkCopyTimeout = 600;
-            bulkCopy.NotifyAfter = 1000;
+            bulkCopy.NotifyAfter = 10000;
             long streamedRows = 0;
-            bulkCopy.SqlRowsCopied += (sender, e) => { streamedRows = e.RowsCopied; Console.Write("."); };
+            bulkCopy.SqlRowsCopied += (sender, e) => { streamedRows = e.RowsCopied; if (e.RowsCopied % 50000 == 0) Log.Information("[DataSync] {DestTable}: {RowsCopied} rows copied...", destTable, e.RowsCopied); };
 
             bool transformTenantId = (sourceTenantId.HasValue && targetTenantId.HasValue && sourceTenantId != targetTenantId && hasTenantId);
             bool transformUsers = (userMapping != null && userMapping.Count > 0);
-            // Dùng buffer path khi có cột string/binary (chung hoặc chỉ ở target) để set MaxLength đúng, tránh BCP "invalid column length" (vd. ProfilePhoto varbinary(max))
             bool useBufferPath = transformTenantId || transformUsers || adcOnlyCols.Count > 0 || typeMismatchColNames.Count > 0 || stringLengthTruncateCols.Count > 0 || hasCommonStringCols || hasCommonBinaryCols || hasTargetBinaryCols;
+
+            long totalRows = 0;
+            int totalTruncations = 0;
 
             if (useBufferPath)
             {
-                if (transformTenantId) Console.WriteLine($"   -> Transforming TenantId: {sourceTenantId} -> {targetTenantId}");
-                if (transformUsers) Console.WriteLine($"   -> Transforming User IDs (Audit Fields)");
+                if (transformTenantId) Log.Information("   -> Transforming TenantId: {SourceTenantId} -> {TargetTenantId}", sourceTenantId, targetTenantId);
+                if (transformUsers) Log.Information("   -> Transforming User IDs (Audit Fields)");
 
-                // 1. Build DataTable schema from reader: only set MaxLength for string columns; 2. Do not set for nvarchar(max)
                 var dt = new DataTable();
                 using (var schemaTable = reader.GetSchemaTable())
                 {
@@ -288,7 +306,6 @@ namespace Logistics.DbMerger
                             var colName = (string)schemaRow["ColumnName"];
                             var dataType = (Type)schemaRow["DataType"];
                             var col = new DataColumn(colName, dataType);
-                            // DataColumn.MaxLength chỉ áp dụng cho string; không set cho byte[]. Quy tắc vàng: nvarchar(max)/varchar(max) → KHÔNG set MaxLength
                             if (dataType == typeof(string) && schemaRow["ColumnSize"] != DBNull.Value && schemaRow["ColumnSize"] is int size
                                 && size > 0 && size != -1 && size != 2147483647)
                                 col.MaxLength = size;
@@ -310,11 +327,11 @@ namespace Logistics.DbMerger
                     dt.Columns.Add(adcCol);
                 }
 
-                // 3. ColumnMappings theo thứ tự cột ĐÍCH (ORDINAL_POSITION) để BCP colid khớp; đồng bộ MaxLength với target chỉ cho string
+                var computedColsBuffer = await GetComputedColumnNamesAsync(targetConn, destTable, transaction);
                 foreach (var targetColInfo in targetColsWithDefault)
                 {
                     var colName = targetColInfo.Schema.ColumnName;
-                    if (!dt.Columns.Contains(colName)) continue;
+                    if (!dt.Columns.Contains(colName) || computedColsBuffer.Contains(colName)) continue;
                     bulkCopy.ColumnMappings.Add(colName, colName);
                 }
                 foreach (DataColumn col in dt.Columns)
@@ -327,7 +344,6 @@ namespace Logistics.DbMerger
                         col.MaxLength = maxLen;
                 }
 
-                var totalRows = 0;
                 while (true)
                 {
                     for (int i = 0; i < _batchSize && reader.Read(); i++)
@@ -369,37 +385,60 @@ namespace Logistics.DbMerger
                                     if (userMapping!.TryGetValue(oldId, out long newId))
                                         row[colName] = newId;
                                 }
-                                catch { /* ignore conversion */ }
+                                catch (Exception ex) { Log.Debug("[Data] User ID mapping conversion failed for column {Column}: {Error}", colName, ex.Message); }
                             }
                         }
                     }
 
-                    TruncateStringRowsToColumnMaxLength(dt);
+                    totalTruncations += TruncateStringRowsToColumnMaxLength(dt, destTable);
                     await bulkCopy.WriteToServerAsync(dt);
                     totalRows += dt.Rows.Count;
                     dt.Rows.Clear();
                 }
 
-                Console.WriteLine($"\n[Data] Completed {sourceTableName} (Transformed {totalRows} rows)");
+                Log.Information("[Data] Completed {SourceTable} (Transformed {TotalRows} rows)", sourceTableName, totalRows);
+                if (totalTruncations > 0)
+                    Log.Information("[Truncation] {DestTable}: {TotalTruncations} values truncated", destTable, totalTruncations);
             }
             else
             {
                 // Streaming Mode (No ID Transform)
+                // Exclude computed columns from mapping — BulkCopy cannot write to them
+                var computedCols = await GetComputedColumnNamesAsync(targetConn, destTable, transaction);
                 for (int i = 0; i < reader.FieldCount; i++)
                 {
                     string colName = reader.GetName(i);
-                    if (targetSchemaCols.Contains(colName))
+                    if (targetSchemaCols.Contains(colName) && !computedCols.Contains(colName))
                         bulkCopy.ColumnMappings.Add(colName, colName);
                 }
-                try
-                {
-                    await bulkCopy.WriteToServerAsync(reader);
-                    Console.WriteLine($"\n[Data] Completed {sourceTableName} | Rows copied: {streamedRows} (streaming BulkCopy)");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"\n[Error] Failed to migrate {sourceTableName}: {ex.Message}");
-                }
+
+                await bulkCopy.WriteToServerAsync(reader);
+                // streamedRows only updates every NotifyAfter (10000) rows — query source for accurate count
+                reader.Close();
+                var countSql = $"SELECT COUNT_BIG(*) FROM [{sourceTableName.Replace("]", "]]")}]{whereClause}";
+                using var countCmd = new SqlCommand(countSql, sourceConn);
+                countCmd.CommandTimeout = 120;
+                if (sourceTenantId.HasValue && whereClause.Contains("@TenantId"))
+                    countCmd.Parameters.AddWithValue("@TenantId", sourceTenantId.Value);
+                totalRows = (long)(await countCmd.ExecuteScalarAsync() ?? 0L);
+                Log.Information("[Data] Completed {SourceTable} | Rows: {TotalRows} (streaming BulkCopy)", sourceTableName, totalRows);
+                // Post-copy truncation detection for streaming path: check target table for values at column max length
+                if (totalRows > 0)
+                    await DetectStagingTruncationsAsync(targetConn, destTable, destTable, transaction);
+            }
+
+            transaction.Commit();
+            sw.Stop();
+            TotalRowsMigrated += totalRows;
+            var rowsPerSec = sw.Elapsed.TotalSeconds > 0 ? (long)(totalRows / sw.Elapsed.TotalSeconds) : totalRows;
+            Log.Information("[DataSync] Committed {DestTable} — {TotalRows} rows in {ElapsedMs}ms ({RowsPerSec} rows/sec)", destTable, totalRows, sw.ElapsedMilliseconds, rowsPerSec);
+            ReportWriter.AddDataSyncTable(sourceTableName, destTable, totalRows, sw.ElapsedMilliseconds, "Tenant-filtered", null);
+            }
+            catch (Exception ex)
+            {
+                try { transaction.Rollback(); } catch { /* rollback can fail if connection dropped */ }
+                Log.Warning("[DataSync] Rolled back {DestTable}: {ErrorMessage}", destTable, ex.Message);
+                throw; // Re-throw so caller skips checkpoint and continues to next table
             }
             }
             finally
@@ -422,12 +461,18 @@ namespace Logistics.DbMerger
             int? targetTenantId,
             Dictionary<long, long>? userMapping)
         {
-            Console.WriteLine($"[Data] Migrating {sourceTableName} -> {targetTableName}... (Natural PK, insert missing only)");
+            Log.Information("[Data] Migrating {SourceTable} -> {TargetTable}... (Natural PK, insert missing only)", sourceTableName, targetTableName);
+            var sw = Stopwatch.StartNew();
             var stagingName = targetTableName + "_staging";
-            await CreateStagingTableForCompositeAsync(sourceConn, targetConn, sourceTableName, targetTableName); // same schema as source, name = targetTableName_staging
+
+            // Begin external transaction for per-table rollback safety (FR24, NFR6)
+            using var transaction = targetConn.BeginTransaction();
+            try
+            {
+            await CreateStagingTableForCompositeAsync(sourceConn, targetConn, sourceTableName, targetTableName, transaction);
 
             bool hasTenantId = await HasTenantIdColumnAsync(sourceConn, sourceTableName);
-            string whereClause = (sourceTenantId.HasValue && hasTenantId) ? $" WHERE TenantId = {sourceTenantId.Value}" : "";
+            string whereClause = (sourceTenantId.HasValue && hasTenantId) ? " WHERE TenantId = @TenantId" : "";
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
             var sourceColNames = new HashSet<string>(sourceCols.Select(c => c.ColumnName), StringComparer.OrdinalIgnoreCase);
             var selectParts = sourceCols.Select(c => $"[{c.ColumnName.Replace("]", "]]")}]").ToList();
@@ -436,8 +481,10 @@ namespace Logistics.DbMerger
             using (var selectCmd = new SqlCommand(selectSql, sourceConn))
             {
                 selectCmd.CommandTimeout = 600;
+                if (sourceTenantId.HasValue && hasTenantId)
+                    selectCmd.Parameters.AddWithValue("@TenantId", sourceTenantId.Value);
                 using var reader = await selectCmd.ExecuteReaderAsync();
-                var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.TableLock, null);
+                using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.CheckConstraints, transaction);
                 bulkCopy.DestinationTableName = stagingName;
                 bulkCopy.BatchSize = _batchSize;
                 bulkCopy.BulkCopyTimeout = 600;
@@ -450,11 +497,31 @@ namespace Logistics.DbMerger
                     using (var schemaTable = reader.GetSchemaTable())
                     {
                         if (schemaTable != null)
-                            foreach (DataRow row in schemaTable.Rows)
-                                dt.Columns.Add(new DataColumn((string)row["ColumnName"], (Type)row["DataType"]));
+                            foreach (DataRow schemaRow in schemaTable.Rows)
+                            {
+                                var colName2 = (string)schemaRow["ColumnName"];
+                                var dataType = (Type)schemaRow["DataType"];
+                                var col = new DataColumn(colName2, dataType);
+                                if (dataType == typeof(string) && schemaRow["ColumnSize"] != DBNull.Value && schemaRow["ColumnSize"] is int sz
+                                    && sz > 0 && sz != -1 && sz != 2147483647)
+                                    col.MaxLength = sz;
+                                dt.Columns.Add(col);
+                            }
+                    }
+                    // Override MaxLength from target column schema for truncation detection
+                    var targetColsForTrunc = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
+                    var targetColByName = targetColsForTrunc.ToDictionary(t => t.Schema.ColumnName, t => t.Schema, StringComparer.OrdinalIgnoreCase);
+                    foreach (DataColumn col in dt.Columns)
+                    {
+                        if (col.DataType != typeof(string)) continue;
+                        if (!targetColByName.TryGetValue(col.ColumnName, out var tc) || !tc.CharacterMaximumLength.HasValue) continue;
+                        var maxLen = tc.CharacterMaximumLength.Value;
+                        if (maxLen > 0 && maxLen != -1 && maxLen != 2147483647)
+                            col.MaxLength = maxLen;
                     }
                     foreach (DataColumn col in dt.Columns)
                         bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    int totalTruncations = 0;
                     while (true)
                     {
                         for (int i = 0; i < _batchSize && reader.Read(); i++)
@@ -468,21 +535,24 @@ namespace Logistics.DbMerger
                         if (transformTenantId && dt.Columns.Contains("TenantId"))
                             foreach (DataRow row in dt.Rows) row["TenantId"] = targetTenantId!.Value;
                         if (transformUsers)
-                            foreach (var colName in new[] { "CreatorUserId", "LastModifierUserId", "DeleterUserId", "CreatedBy", "ModifiedBy", "UserId" })
-                                if (dt.Columns.Contains(colName))
+                            foreach (var colName2 in new[] { "CreatorUserId", "LastModifierUserId", "DeleterUserId", "CreatedBy", "ModifiedBy", "UserId" })
+                                if (dt.Columns.Contains(colName2))
                                     foreach (DataRow row in dt.Rows)
                                     {
-                                        if (row[colName] == DBNull.Value) continue;
+                                        if (row[colName2] == DBNull.Value) continue;
                                         try
                                         {
-                                            if (userMapping!.TryGetValue(Convert.ToInt64(row[colName]), out long newId))
-                                                row[colName] = newId;
+                                            if (userMapping!.TryGetValue(Convert.ToInt64(row[colName2]), out long newId))
+                                                row[colName2] = newId;
                                         }
-                                        catch { }
+                                        catch (Exception ex) { Log.Debug("[Data] User ID mapping conversion failed for column {Column}: {Error}", colName2, ex.Message); }
                                     }
+                        totalTruncations += TruncateStringRowsToColumnMaxLength(dt, targetTableName);
                         await bulkCopy.WriteToServerAsync(dt);
                         dt.Rows.Clear();
                     }
+                    if (totalTruncations > 0)
+                        Log.Information("[Truncation] {TargetTable}: {TotalTruncations} values truncated (NaturalPk buffered path)", targetTableName, totalTruncations);
                 }
                 else
                 {
@@ -492,8 +562,11 @@ namespace Logistics.DbMerger
                 }
             }
 
-            var targetColsWithDefault = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName);
-            var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName);
+            // Detect potential truncations in staging table
+            await DetectStagingTruncationsAsync(targetConn, stagingName, targetTableName, transaction);
+
+            var targetColsWithDefault = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
+            var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName, transaction);
             var pkColEsc = pkInfo.ColumnName.Replace("]", "]]");
             var targetEsc = targetTableName.Replace("]", "]]");
             var stagingEsc = stagingName.Replace("]", "]]");
@@ -513,39 +586,54 @@ INSERT INTO [dbo].[{targetEsc}] ({string.Join(", ", insertCols)})
 SELECT {string.Join(", ", selectExprs)}
 FROM [dbo].[{stagingEsc}] s
 WHERE NOT EXISTS (SELECT 1 FROM [dbo].[{targetEsc}] t WHERE t.[{pkColEsc}] = s.[{pkColEsc}])";
-            var inserted = await targetConn.ExecuteAsync(insertSql, commandTimeout: 600);
-            await DropStagingTableIfExistsAsync(targetConn, stagingName);
-            Console.WriteLine($"   -> Natural PK: inserted {inserted} missing row(s) into [dbo].[{targetTableName}] (skipped existing).");
+            var inserted = await targetConn.ExecuteAsync(insertSql, commandTimeout: 600, transaction: transaction);
+            await DropStagingTableIfExistsAsync(targetConn, stagingName, transaction);
+
+            transaction.Commit();
+            Log.Information("   -> Natural PK: inserted {Inserted} missing row(s) into [dbo].[{TargetTable}] (skipped existing).", inserted, targetTableName);
+            sw.Stop();
+            TotalRowsMigrated += inserted;
+            var rowsPerSec = sw.Elapsed.TotalSeconds > 0 ? (long)(inserted / sw.Elapsed.TotalSeconds) : inserted;
+            Log.Information("[DataSync] Committed {TargetTable} — {Inserted} rows in {ElapsedMs}ms ({RowsPerSec} rows/sec)", targetTableName, inserted, sw.ElapsedMilliseconds, rowsPerSec);
+            ReportWriter.AddDataSyncTable(sourceTableName, targetTableName, inserted, sw.ElapsedMilliseconds, "Natural-PK", null);
+            }
+            catch (Exception ex)
+            {
+                try { transaction.Rollback(); } catch { }
+                Log.Warning("[DataSync] Rolled back {TargetTable}: {ErrorMessage}", targetTableName, ex.Message);
+                throw;
+            }
         }
 
         /// <summary>
         /// Creates staging table on target: OldId (PK type) + all source columns except PK. Drops existing if present.
         /// </summary>
-        public async Task CreateStagingTableAsync(SqlConnection sourceConn, SqlConnection targetConn, string sourceTableName, string targetTableName, PkColumnInfo pkInfo)
+        public async Task CreateStagingTableAsync(SqlConnection sourceConn, SqlConnection targetConn, string sourceTableName, string targetTableName, PkColumnInfo pkInfo, SqlTransaction? transaction = null)
         {
             var stagingName = targetTableName + "_staging";
-            await DropStagingTableIfExistsAsync(targetConn, stagingName);
+            await DropStagingTableIfExistsAsync(targetConn, stagingName, transaction);
 
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
             var pkColName = pkInfo.ColumnName;
             var nonPkCols = sourceCols.Where(c => !string.Equals(c.ColumnName, pkColName, StringComparison.OrdinalIgnoreCase)).ToList();
 
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"CREATE TABLE [dbo].[{stagingName}] (");
+            sb.AppendLine($"CREATE TABLE [dbo].[{stagingName.Replace("]", "]]")}] (");
             sb.AppendLine($"  [OldId] {GetPkSqlType(pkInfo.DataType)} NOT NULL,");
             foreach (var c in nonPkCols)
             {
                 var nullable = " NULL";
-                sb.AppendLine($"  [{c.ColumnName}] {GetSqlTypeString(c)}{nullable},");
+                sb.AppendLine($"  [{c.ColumnName.Replace("]", "]]")}] {GetSqlTypeString(c)}{nullable},");
             }
-            sb.Length -= 2; // remove last comma + newline
+            sb.Length -= Environment.NewLine.Length + 1; // remove last comma + newline
             sb.AppendLine();
             sb.AppendLine(");");
 
             using var cmd = new SqlCommand(sb.ToString(), targetConn);
+            if (transaction != null) cmd.Transaction = transaction;
             cmd.CommandTimeout = 60;
             await cmd.ExecuteNonQueryAsync();
-            Console.WriteLine($"   -> Created staging table [dbo].[{stagingName}]");
+            Log.Information("   -> Created staging table [dbo].[{StagingName}]", stagingName);
         }
 
         private static string GetPkSqlType(string dataType)
@@ -559,34 +647,35 @@ WHERE NOT EXISTS (SELECT 1 FROM [dbo].[{targetEsc}] t WHERE t.[{pkColEsc}] = s.[
             };
         }
 
-        private static async Task DropStagingTableIfExistsAsync(SqlConnection conn, string stagingName)
+        private static async Task DropStagingTableIfExistsAsync(SqlConnection conn, string stagingName, SqlTransaction? transaction = null)
         {
             var objName = "dbo." + stagingName;
-            await conn.ExecuteAsync("IF OBJECT_ID(@Name, 'U') IS NOT NULL DROP TABLE [dbo].[" + stagingName.Replace("]", "]]") + "]", new { Name = objName });
+            await conn.ExecuteAsync("IF OBJECT_ID(@Name, 'U') IS NOT NULL DROP TABLE [dbo].[" + stagingName.Replace("]", "]]") + "]", new { Name = objName }, transaction: transaction);
         }
 
         /// <summary>
         /// Creates staging table with same structure as source (all columns). For composite-key table migration.
         /// </summary>
-        public async Task CreateStagingTableForCompositeAsync(SqlConnection sourceConn, SqlConnection targetConn, string sourceTableName, string targetTableName)
+        public async Task CreateStagingTableForCompositeAsync(SqlConnection sourceConn, SqlConnection targetConn, string sourceTableName, string targetTableName, SqlTransaction? transaction = null)
         {
             var stagingName = targetTableName + "_staging";
-            await DropStagingTableIfExistsAsync(targetConn, stagingName);
+            await DropStagingTableIfExistsAsync(targetConn, stagingName, transaction);
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"CREATE TABLE [dbo].[{stagingName}] (");
+            sb.AppendLine($"CREATE TABLE [dbo].[{stagingName.Replace("]", "]]")}] (");
             foreach (var c in sourceCols)
             {
                 var nullable = " NULL";
-                sb.AppendLine($"  [{c.ColumnName}] {GetSqlTypeString(c)}{nullable},");
+                sb.AppendLine($"  [{c.ColumnName.Replace("]", "]]")}] {GetSqlTypeString(c)}{nullable},");
             }
-            sb.Length -= 2;
+            sb.Length -= Environment.NewLine.Length + 1; // remove last comma + newline
             sb.AppendLine();
             sb.AppendLine(");");
             using var cmd = new SqlCommand(sb.ToString(), targetConn);
+            if (transaction != null) cmd.Transaction = transaction;
             cmd.CommandTimeout = 60;
             await cmd.ExecuteNonQueryAsync();
-            Console.WriteLine($"   -> Created staging table [dbo].[{stagingName}] (composite)");
+            Log.Information("   -> Created staging table [dbo].[{StagingName}] (composite)", stagingName);
         }
 
         /// <summary>
@@ -600,25 +689,33 @@ WHERE NOT EXISTS (SELECT 1 FROM [dbo].[{targetEsc}] t WHERE t.[{pkColEsc}] = s.[
             List<string> pkColumnNames,
             List<FkColumnInfo> fkColumns,
             int? sourceTenantId,
-            int? targetTenantId)
+            int? targetTenantId,
+            Dictionary<long, long>? userMapping = null)
         {
+            // Begin external transaction for per-table rollback safety (FR24, NFR6)
+            using var transaction = targetConn.BeginTransaction();
+            try
+            {
+            var sw = Stopwatch.StartNew();
             bool hasTenantId = await TableHasTenantIdColumnAsync(sourceConn, sourceTableName);
             string whereClause = "";
             if (sourceTenantId.HasValue && hasTenantId)
-                whereClause = $" WHERE TenantId = {sourceTenantId.Value}";
+                whereClause = " WHERE TenantId = @TenantId";
 
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
             var sourceColNames = new HashSet<string>(sourceCols.Select(c => c.ColumnName), StringComparer.OrdinalIgnoreCase);
 
             var stagingName = targetTableName + "_staging";
-            await CreateStagingTableForCompositeAsync(sourceConn, targetConn, sourceTableName, targetTableName);
+            await CreateStagingTableForCompositeAsync(sourceConn, targetConn, sourceTableName, targetTableName, transaction);
 
             var selectSql = "SELECT * FROM [" + sourceTableName.Replace("]", "]]") + "]" + whereClause;
             using (var selectCmd = new SqlCommand(selectSql, sourceConn))
             {
                 selectCmd.CommandTimeout = 600;
+                if (sourceTenantId.HasValue && hasTenantId)
+                    selectCmd.Parameters.AddWithValue("@TenantId", sourceTenantId.Value);
                 using var reader = await selectCmd.ExecuteReaderAsync();
-                var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.TableLock, null);
+                using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.CheckConstraints, transaction);
                 bulkCopy.DestinationTableName = stagingName;
                 bulkCopy.BatchSize = _batchSize;
                 bulkCopy.BulkCopyTimeout = 600;
@@ -626,18 +723,43 @@ WHERE NOT EXISTS (SELECT 1 FROM [dbo].[{targetEsc}] t WHERE t.[{pkColEsc}] = s.[
                     bulkCopy.ColumnMappings.Add(reader.GetName(i), reader.GetName(i));
                 await bulkCopy.WriteToServerAsync(reader);
             }
-            Console.Write(".");
+
+            // Detect potential truncations in staging table (streaming path has no in-memory check)
+            await DetectStagingTruncationsAsync(targetConn, stagingName, targetTableName, transaction);
 
             bool transformTenantId = sourceTenantId.HasValue && targetTenantId.HasValue && sourceTenantId != targetTenantId && hasTenantId;
             if (transformTenantId)
             {
                 await targetConn.ExecuteAsync(
                     $"UPDATE [dbo].[{stagingName.Replace("]", "]]")}] SET TenantId = @TenantId",
-                    new { TenantId = targetTenantId!.Value });
+                    new { TenantId = targetTenantId!.Value }, transaction: transaction);
             }
 
-            var targetCols = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName);
-            var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName);
+            // Remap user audit columns in staging table via userMapping
+            if (userMapping != null && userMapping.Count > 0)
+            {
+                var stagingEsc = stagingName.Replace("]", "]]");
+                string[] userCols = new[] { "CreatorUserId", "LastModifierUserId", "DeleterUserId", "CreatedBy", "ModifiedBy", "UserId" };
+                foreach (var colName in userCols)
+                {
+                    if (!sourceColNames.Contains(colName))
+                        continue;
+                    var colEsc = colName.Replace("]", "]]");
+                    // Use a temp table to hold the mapping for efficient batch UPDATE
+                    // For smaller mappings, individual UPDATEs per key are acceptable;
+                    // use a JOIN-based approach against a VALUES list for larger mappings
+                    foreach (var kvp in userMapping)
+                    {
+                        await targetConn.ExecuteAsync(
+                            $"UPDATE [dbo].[{stagingEsc}] SET [{colEsc}] = @NewId WHERE [{colEsc}] = @OldId",
+                            new { OldId = kvp.Key, NewId = kvp.Value },
+                            transaction: transaction, commandTimeout: 120);
+                    }
+                }
+            }
+
+            var targetCols = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
+            var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName, transaction);
             var fkByChildCol = fkColumns.ToDictionary(f => f.ChildColumn, f => f, StringComparer.OrdinalIgnoreCase);
             var fkColumnToAlias = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var usedFkForParams = new List<(string RefTable, string RefCol)>();
@@ -707,9 +829,23 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
                 prm.Add("RefTable_" + (i + 1), usedFkForParams[i].RefTable);
                 prm.Add("RefCol_" + (i + 1), usedFkForParams[i].RefCol);
             }
-            var inserted = await targetConn.ExecuteAsync(insertSql, prm);
-            await DropStagingTableIfExistsAsync(targetConn, stagingName);
-            Console.WriteLine($"\n   -> Composite key: inserted {inserted} row(s) into [dbo].[{targetTableName}] (skipped existing).");
+            var inserted = await targetConn.ExecuteAsync(insertSql, prm, transaction: transaction);
+            await DropStagingTableIfExistsAsync(targetConn, stagingName, transaction);
+
+            transaction.Commit();
+            Log.Information("   -> Composite key: inserted {Inserted} row(s) into [dbo].[{TargetTable}] (skipped existing).", inserted, targetTableName);
+            sw.Stop();
+            TotalRowsMigrated += inserted;
+            var rowsPerSec = sw.Elapsed.TotalSeconds > 0 ? (long)(inserted / sw.Elapsed.TotalSeconds) : inserted;
+            Log.Information("[DataSync] Committed {TargetTable} — {Inserted} rows in {ElapsedMs}ms ({RowsPerSec} rows/sec)", targetTableName, inserted, sw.ElapsedMilliseconds, rowsPerSec);
+            ReportWriter.AddDataSyncTable(sourceTableName, targetTableName, inserted, sw.ElapsedMilliseconds, "Composite-PK", null);
+            }
+            catch (Exception ex)
+            {
+                try { transaction.Rollback(); } catch { }
+                Log.Warning("[DataSync] Rolled back {TargetTable}: {ErrorMessage}", targetTableName, ex.Message);
+                throw;
+            }
         }
 
         /// <summary>
@@ -733,6 +869,14 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
         {
             int cmdTimeout = commandTimeoutOverride ?? 600;
             var stagingName = targetTableName + "_staging";
+
+            // Begin external transaction for per-table rollback safety (FR24, NFR6)
+            // Staging table creation is inside the transaction so it's rolled back on failure (Story 14.3)
+            using var transaction = targetConn.BeginTransaction();
+            try
+            {
+            await CreateStagingTableAsync(sourceConn, targetConn, sourceTableName, targetTableName, pkInfo, transaction);
+            var sw = Stopwatch.StartNew();
             var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
             var pkColName = pkInfo.ColumnName;
             var nonPkCols = sourceCols.Where(c => !string.Equals(c.ColumnName, pkColName, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -741,19 +885,21 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             var selectParts = new List<string> { $"[{pkColName}] AS OldId" };
             foreach (var c in nonPkCols)
                 selectParts.Add($"[{c.ColumnName}]");
-            var selectSql = "SELECT " + string.Join(", ", selectParts) + $" FROM [{sourceTableName}]{whereClause}";
+            var selectSql = "SELECT " + string.Join(", ", selectParts) + $" FROM [{sourceTableName.Replace("]", "]]")}]{whereClause}";
 
             using var selectCmd = new SqlCommand(selectSql, sourceConn);
             selectCmd.CommandTimeout = cmdTimeout;
+            if (sourceTenantId.HasValue && whereClause.Contains("@TenantId"))
+                selectCmd.Parameters.AddWithValue("@TenantId", sourceTenantId.Value);
             using var reader = await selectCmd.ExecuteReaderAsync();
 
-            var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.TableLock, null);
+            using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.CheckConstraints, transaction);
             bulkCopy.DestinationTableName = stagingName;
             bulkCopy.BatchSize = _batchSize;
             // For large-table runs (commandTimeoutOverride set), use 0 = no timeout so bulk copy is not killed
             bulkCopy.BulkCopyTimeout = commandTimeoutOverride.HasValue ? 0 : cmdTimeout;
-            bulkCopy.NotifyAfter = 1000;
-            bulkCopy.SqlRowsCopied += (_, _) => Console.Write(".");
+            bulkCopy.NotifyAfter = 10000;
+            bulkCopy.SqlRowsCopied += (_, e) => { if (e.RowsCopied % 50000 == 0) Log.Information("[DataSync] {TargetTableName}: {RowsCopied} rows staged...", targetTableName, e.RowsCopied); };
 
             bool hasTenantId = nonPkCols.Any(c => string.Equals(c.ColumnName, "TenantId", StringComparison.OrdinalIgnoreCase));
             bool transformTenantId = sourceTenantId.HasValue && targetTenantId.HasValue && sourceTenantId != targetTenantId && hasTenantId;
@@ -778,13 +924,25 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
                         }
                     }
                 }
-                var stagingColsOrder = await GetTargetColumnsWithDefaultsAsync(targetConn, stagingName);
+                var stagingColsOrder = await GetTargetColumnsWithDefaultsAsync(targetConn, stagingName, transaction);
                 foreach (var t in stagingColsOrder)
                 {
                     if (dt.Columns.Contains(t.Schema.ColumnName))
                         bulkCopy.ColumnMappings.Add(t.Schema.ColumnName, t.Schema.ColumnName);
                 }
+                // Override MaxLength from target table schema for truncation detection (staging has source-sized columns)
+                var targetColsForIdMap = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
+                var targetColByNameIdMap = targetColsForIdMap.ToDictionary(t => t.Schema.ColumnName, t => t.Schema, StringComparer.OrdinalIgnoreCase);
+                foreach (DataColumn col in dt.Columns)
+                {
+                    if (col.DataType != typeof(string)) continue;
+                    if (!targetColByNameIdMap.TryGetValue(col.ColumnName, out var tc) || !tc.CharacterMaximumLength.HasValue) continue;
+                    var maxLen = tc.CharacterMaximumLength.Value;
+                    if (maxLen > 0 && maxLen != -1 && maxLen != 2147483647)
+                        col.MaxLength = maxLen;
+                }
 
+                int totalTruncations = 0;
                 while (true)
                 {
                     for (int i = 0; i < _batchSize && reader.Read(); i++)
@@ -810,32 +968,37 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
                                     if (userMapping!.TryGetValue(Convert.ToInt64(row[colName]), out long newId))
                                         row[colName] = newId;
                                 }
-                                catch { }
+                                catch (Exception ex) { Log.Debug("[Data] User ID mapping conversion failed for column {Column}: {Error}", colName, ex.Message); }
                             }
                         }
                     }
+                    totalTruncations += TruncateStringRowsToColumnMaxLength(dt, targetTableName);
                     await bulkCopy.WriteToServerAsync(dt);
                     dt.Rows.Clear();
                 }
+                if (totalTruncations > 0)
+                    Log.Information("[Truncation] {TargetTable}: {TotalTruncations} values truncated (IdMapping buffered path)", targetTableName, totalTruncations);
             }
             else
             {
                 for (int i = 0; i < reader.FieldCount; i++)
                     bulkCopy.ColumnMappings.Add(reader.GetName(i), reader.GetName(i));
                 await bulkCopy.WriteToServerAsync(reader);
+                // Detect potential truncations in staging table (streaming path has no in-memory check)
+                await DetectStagingTruncationsAsync(targetConn, stagingName, targetTableName, transaction);
             }
 
-            Console.WriteLine();
+            Log.Information("");
 
             // Target columns and ADC-only defaults for MERGE
-            var targetColsWithDefault = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName);
+            var targetColsWithDefault = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
             var stagingColNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "OldId" };
             foreach (var c in nonPkCols) stagingColNames.Add(c.ColumnName);
             var adcOnlyCols = targetColsWithDefault.Where(t => !stagingColNames.Contains(t.Schema.ColumnName) && !string.Equals(t.Schema.ColumnName, pkColName, StringComparison.OrdinalIgnoreCase)).ToList();
             var targetColsExceptPk = targetColsWithDefault.Where(t => !string.Equals(t.Schema.ColumnName, pkColName, StringComparison.OrdinalIgnoreCase)).ToList();
-            var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName);
+            var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName, transaction);
 
-            bool hasIdentity = await HasIdentityColumnAsync(targetConn, targetTableName);
+            bool hasIdentity = await HasIdentityColumnAsync(targetConn, targetTableName, transaction);
             bool pkIsGuid = string.Equals(pkInfo.DataType, "uniqueidentifier", StringComparison.OrdinalIgnoreCase);
 
             var insertCols = new List<string>();
@@ -869,6 +1032,7 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
             var stagingEsc = stagingName.Replace("]", "]]");
             var targetEsc = targetTableName.Replace("]", "]]");
 
+            int totalInserted = 0;
             if (mergeChunkSize > 0 && mappingTable != null)
             {
                 // MERGE theo chunk: mỗi chunk SELECT INTO #Chunk, MERGE, INSERT IdMapping, DELETE staging; giảm memory và timeout cho bảng lớn
@@ -876,6 +1040,7 @@ FROM [dbo].[{stagingName.Replace("]", "]]")}] {mapAlias}
                 int totalMapped = 0;
                 int iteration = 0;
                 var chunkSql = $@"
+IF OBJECT_ID('tempdb..#Chunk') IS NOT NULL DROP TABLE #Chunk;
 SELECT TOP (@ChunkSize) * INTO #Chunk FROM [dbo].[{stagingEsc}] ORDER BY OldId;
 DECLARE @Mapping TABLE (OldId {pkSqlType}, NewId {pkSqlType});
 MERGE [dbo].[{targetEsc}] AS t
@@ -891,18 +1056,19 @@ SELECT COUNT(*) FROM @Mapping;";
                 var chunkPrm = new { ChunkSize = mergeChunkSize, TableName = targetTableName, ColumnName = pkColName, MigrationBatch = migrationBatch, TenantId = (int?)tenantId };
                 while (true)
                 {
-                    var rowsInChunk = await targetConn.ExecuteScalarAsync<int>(chunkSql, chunkPrm, commandTimeout: cmdTimeout);
+                    var rowsInChunk = await targetConn.ExecuteScalarAsync<int>(chunkSql, chunkPrm, commandTimeout: cmdTimeout, transaction: transaction);
                     if (rowsInChunk == 0) break;
                     totalMapped += rowsInChunk;
                     iteration++;
-                    if (iteration % 10 == 0 || rowsInChunk < mergeChunkSize)
-                        Console.Write(".");
+                    if (iteration % 10 == 0)
+                        Log.Information("[DataSync] {TargetTable}: {TotalMapped} rows merged ({Iteration} chunks)...", targetTableName, totalMapped, iteration);
                 }
                 if (totalMapped > 0)
                 {
-                    Console.WriteLine($"\n   -> Inserted {totalMapped} row(s) into [dbo].[{targetTableName}] (chunked MERGE)");
-                    Console.WriteLine($"   -> IdMapping (chunked): {totalMapped} row(s) -> [dbo].[{mappingTable}]");
+                    Log.Information("   -> Inserted {TotalMapped} row(s) into [dbo].[{TargetTable}] (chunked MERGE)", totalMapped, targetTableName);
+                    Log.Information("   -> IdMapping (chunked): {TotalMapped} row(s) -> [dbo].[{MappingTable}]", totalMapped, mappingTable);
                 }
+                totalInserted = totalMapped;
             }
             else
             {
@@ -914,26 +1080,301 @@ WHEN NOT MATCHED THEN
   INSERT ({string.Join(", ", insertCols)})
   VALUES ({string.Join(", ", valueExprs)})
 OUTPUT s.OldId, inserted.[{pkColName}] INTO @Mapping(OldId, NewId);";
+                mergeSql += "\nSELECT COUNT(*) FROM @Mapping;";
                 if (mappingTable != null)
                 {
                     var mappingTableEsc = mappingTable.Replace("]", "]]");
-                    mergeSql += $@"
-INSERT INTO [dbo].[{mappingTableEsc}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
-SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @Mapping;";
+                    // Insert into IdMapping before the SELECT COUNT so we capture the count after all mutations
+                    mergeSql = mergeSql.Replace("SELECT COUNT(*) FROM @Mapping;",
+                        $@"INSERT INTO [dbo].[{mappingTableEsc}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId)
+SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @Mapping;
+SELECT COUNT(*) FROM @Mapping;");
                 }
                 var prm = new { TableName = targetTableName, ColumnName = pkColName, MigrationBatch = migrationBatch, TenantId = (int?)tenantId };
-                var rowsAffected = await targetConn.ExecuteAsync(mergeSql, prm, commandTimeout: cmdTimeout);
-                var insertedCount = mappingTable != null ? rowsAffected / 2 : rowsAffected;
+                var insertedCount = await targetConn.ExecuteScalarAsync<int>(mergeSql, prm, commandTimeout: cmdTimeout, transaction: transaction);
                 if (insertedCount > 0)
                 {
-                    Console.WriteLine($"   -> Inserted {insertedCount} row(s) into [dbo].[{targetTableName}]");
+                    Log.Information("   -> Inserted {InsertedCount} row(s) into [dbo].[{TargetTable}]", insertedCount, targetTableName);
                     if (mappingTable != null)
-                        Console.WriteLine($"   -> IdMapping (bulk): {insertedCount} row(s) -> [dbo].[{mappingTable}]");
+                        Log.Information("   -> IdMapping (bulk): {InsertedCount} row(s) -> [dbo].[{MappingTable}]", insertedCount, mappingTable);
                 }
+                totalInserted = insertedCount;
             }
 
-            await DropStagingTableIfExistsAsync(targetConn, stagingName);
-            Console.WriteLine($"   -> Dropped [dbo].[{stagingName}]");
+            await DropStagingTableIfExistsAsync(targetConn, stagingName, transaction);
+            Log.Information("   -> Dropped [dbo].[{StagingName}]", stagingName);
+
+            transaction.Commit();
+            sw.Stop();
+            TotalRowsMigrated += totalInserted;
+            var rowsPerSec = sw.Elapsed.TotalSeconds > 0 ? (long)(totalInserted / sw.Elapsed.TotalSeconds) : totalInserted;
+            Log.Information("[DataSync] Committed {TargetTable} — {TotalInserted} rows in {ElapsedMs}ms ({RowsPerSec} rows/sec)", targetTableName, totalInserted, sw.ElapsedMilliseconds, rowsPerSec);
+            ReportWriter.AddDataSyncTable(sourceTableName, targetTableName, totalInserted, sw.ElapsedMilliseconds, "IdMapping", null);
+            }
+            catch (Exception ex)
+            {
+                try { transaction.Rollback(); } catch { }
+                Log.Warning("[DataSync] Rolled back {TargetTable}: {ErrorMessage}", targetTableName, ex.Message);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// MERGE upsert for global tables (no TenantId). Inserts new rows and updates existing MDC-originated rows.
+        /// ADC-native rows are never modified. Tracks inserted rows in IdMapping with TenantId = NULL.
+        /// </summary>
+        public async Task MergeGlobalTableAsync(
+            SqlConnection sourceConn,
+            SqlConnection targetConn,
+            string sourceTableName,
+            string targetTableName,
+            string matchKeyColumn,
+            string migrationBatch,
+            Dictionary<long, long>? userMapping = null,
+            int? commandTimeoutOverride = null)
+        {
+            int cmdTimeout = commandTimeoutOverride ?? 600;
+            var sw = Stopwatch.StartNew();
+            var stagingName = targetTableName + "_staging";
+
+            // Pre-transaction: get PK info (Dapper queries require explicit transaction enrollment)
+            var pkInfo = await GetPkColumnInfoAsync(targetConn, targetTableName);
+            if (pkInfo == null)
+            {
+                Log.Error("[DataSync] No PK found for global table {TargetTable}. Cannot MERGE.", targetTableName);
+                return;
+            }
+
+            using var transaction = targetConn.BeginTransaction();
+            try
+            {
+                // 1. Create staging table with all source columns
+                await CreateStagingTableForCompositeAsync(sourceConn, targetConn, sourceTableName, targetTableName, transaction);
+
+                // 2. BulkCopy all source rows into staging (no TenantId filter)
+                var sourceCols = await GetSourceColumnSchemasAsync(sourceConn, sourceTableName);
+                var sourceColNames = new HashSet<string>(sourceCols.Select(c => c.ColumnName), StringComparer.OrdinalIgnoreCase);
+                var selectParts = sourceCols.Select(c => $"[{c.ColumnName.Replace("]", "]]")}]").ToList();
+                var selectSql = "SELECT " + string.Join(", ", selectParts) + $" FROM [{sourceTableName.Replace("]", "]]")}]";
+
+                using (var selectCmd = new SqlCommand(selectSql, sourceConn))
+                {
+                    selectCmd.CommandTimeout = cmdTimeout;
+                    using var reader = await selectCmd.ExecuteReaderAsync();
+                    using var bulkCopy = new SqlBulkCopy(targetConn, SqlBulkCopyOptions.CheckConstraints, transaction);
+                    bulkCopy.DestinationTableName = stagingName;
+                    bulkCopy.BatchSize = _batchSize;
+                    bulkCopy.BulkCopyTimeout = cmdTimeout;
+
+                    bool transformUsers = userMapping != null && userMapping.Count > 0;
+                    if (transformUsers)
+                    {
+                        var dt = new DataTable();
+                        using (var schemaTable = reader.GetSchemaTable())
+                        {
+                            if (schemaTable != null)
+                                foreach (DataRow schemaRow in schemaTable.Rows)
+                                {
+                                    var colName = (string)schemaRow["ColumnName"];
+                                    var dataType = (Type)schemaRow["DataType"];
+                                    var col = new DataColumn(colName, dataType);
+                                    if (dataType == typeof(string) && schemaRow["ColumnSize"] != DBNull.Value && schemaRow["ColumnSize"] is int sz
+                                        && sz > 0 && sz != -1 && sz != 2147483647)
+                                        col.MaxLength = sz;
+                                    dt.Columns.Add(col);
+                                }
+                        }
+                        // Override MaxLength from target column schema for truncation detection
+                        var targetColsForGlobal = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
+                        var targetColByNameGlobal = targetColsForGlobal.ToDictionary(t => t.Schema.ColumnName, t => t.Schema, StringComparer.OrdinalIgnoreCase);
+                        foreach (DataColumn col in dt.Columns)
+                        {
+                            if (col.DataType != typeof(string)) continue;
+                            if (!targetColByNameGlobal.TryGetValue(col.ColumnName, out var tc) || !tc.CharacterMaximumLength.HasValue) continue;
+                            var maxLen = tc.CharacterMaximumLength.Value;
+                            if (maxLen > 0 && maxLen != -1 && maxLen != 2147483647)
+                                col.MaxLength = maxLen;
+                        }
+                        foreach (DataColumn col in dt.Columns)
+                            bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                        int totalTruncations = 0;
+                        while (true)
+                        {
+                            for (int i = 0; i < _batchSize && reader.Read(); i++)
+                            {
+                                var row = dt.NewRow();
+                                for (int c = 0; c < reader.FieldCount; c++)
+                                    row[c] = reader.IsDBNull(c) ? DBNull.Value : reader.GetValue(c);
+                                dt.Rows.Add(row);
+                            }
+                            if (dt.Rows.Count == 0) break;
+                            foreach (var colName in new[] { "CreatorUserId", "LastModifierUserId", "DeleterUserId", "CreatedBy", "ModifiedBy", "UserId" })
+                                if (dt.Columns.Contains(colName))
+                                    foreach (DataRow row in dt.Rows)
+                                    {
+                                        if (row[colName] == DBNull.Value) continue;
+                                        try
+                                        {
+                                            if (userMapping!.TryGetValue(Convert.ToInt64(row[colName]), out long newId))
+                                                row[colName] = newId;
+                                        }
+                                        catch (Exception ex) { Log.Debug("[Data] User ID mapping conversion failed for column {Column}: {Error}", colName, ex.Message); }
+                                    }
+                            totalTruncations += TruncateStringRowsToColumnMaxLength(dt, targetTableName);
+                            await bulkCopy.WriteToServerAsync(dt);
+                            dt.Rows.Clear();
+                        }
+                        if (totalTruncations > 0)
+                            Log.Information("[Truncation] {TargetTable}: {TotalTruncations} values truncated (global table buffered path)", targetTableName, totalTruncations);
+                    }
+                    else
+                    {
+                        for (int i = 0; i < reader.FieldCount; i++)
+                            bulkCopy.ColumnMappings.Add(reader.GetName(i), reader.GetName(i));
+                        await bulkCopy.WriteToServerAsync(reader);
+                    }
+                }
+
+                // 2b. Detect potential truncations in staging table
+                await DetectStagingTruncationsAsync(targetConn, stagingName, targetTableName, transaction);
+
+                // 3. Target columns and PK setup
+                var pkColumn = pkInfo.ColumnName;
+                var pkColEsc = pkColumn.Replace("]", "]]");
+                bool hasIdentity = await HasIdentityColumnAsync(targetConn, targetTableName, transaction);
+                bool pkIsGuid = string.Equals(pkInfo.DataType, "uniqueidentifier", StringComparison.OrdinalIgnoreCase);
+                var matchKeyEsc = matchKeyColumn.Replace("]", "]]");
+
+                var targetColsWithDefault = await GetTargetColumnsWithDefaultsAsync(targetConn, targetTableName, transaction);
+                var computedCols = await GetComputedColumnNamesAsync(targetConn, targetTableName, transaction);
+                var targetEsc = targetTableName.Replace("]", "]]");
+                var stagingEsc = stagingName.Replace("]", "]]");
+
+                // 4. Build MERGE column lists
+                // UPDATE SET: all non-PK, non-computed columns that exist in both source and target
+                var updateSetParts = new List<string>();
+                var insertCols = new List<string>();
+                var insertVals = new List<string>();
+
+                foreach (var tc in targetColsWithDefault)
+                {
+                    if (computedCols.Contains(tc.Schema.ColumnName)) continue;
+                    var colEsc = tc.Schema.ColumnName.Replace("]", "]]");
+
+                    // For INSERT: exclude identity PK (auto-generated), include GUID PK (preserved)
+                    bool isPkCol = string.Equals(tc.Schema.ColumnName, pkColumn, StringComparison.OrdinalIgnoreCase);
+                    if (isPkCol && hasIdentity)
+                    {
+                        // identity PK: excluded from INSERT (auto-generated)
+                    }
+                    else if (isPkCol && pkIsGuid)
+                    {
+                        // GUID PK: preserve source GUID
+                        insertCols.Add($"[{colEsc}]");
+                        insertVals.Add($"s.[{colEsc}]");
+                    }
+                    else
+                    {
+                        insertCols.Add($"[{colEsc}]");
+                        if (sourceColNames.Contains(tc.Schema.ColumnName))
+                            insertVals.Add($"s.[{colEsc}]");
+                        else
+                            insertVals.Add(GetDefaultSqlForAdcOnlyColumn(tc.Schema.ColumnName, tc));
+                    }
+
+                    // For UPDATE SET: non-PK, non-matchKey columns that exist in source
+                    if (!isPkCol && !string.Equals(tc.Schema.ColumnName, matchKeyColumn, StringComparison.OrdinalIgnoreCase)
+                        && sourceColNames.Contains(tc.Schema.ColumnName))
+                    {
+                        updateSetParts.Add($"t.[{colEsc}] = s.[{colEsc}]");
+                    }
+                }
+
+                // 5. Build and execute MERGE SQL
+                var pkSqlType = pkInfo.DataType?.ToLowerInvariant() switch
+                {
+                    "uniqueidentifier" => "uniqueidentifier",
+                    "bigint" => "bigint",
+                    _ => "int"
+                };
+
+                var updateClause = updateSetParts.Count > 0
+                    ? $"WHEN MATCHED THEN UPDATE SET {string.Join(", ", updateSetParts)}\n"
+                    : "";
+
+                var mergeSql = $@"
+DECLARE @MergeOutput TABLE (MergeAction NVARCHAR(10), OldId {pkSqlType}, NewId {pkSqlType});
+MERGE [dbo].[{targetEsc}] AS t
+USING [dbo].[{stagingEsc}] AS s
+ON t.[{matchKeyEsc}] = s.[{matchKeyEsc}]
+{updateClause}WHEN NOT MATCHED BY TARGET THEN
+  INSERT ({string.Join(", ", insertCols)})
+  VALUES ({string.Join(", ", insertVals)})
+OUTPUT $action, s.[{pkColEsc}], inserted.[{pkColEsc}] INTO @MergeOutput(MergeAction, OldId, NewId);
+SELECT MergeAction, OldId, NewId FROM @MergeOutput;";
+
+                var mergeResults = (await targetConn.QueryAsync<(string MergeAction, object OldId, object NewId)>(
+                    mergeSql, commandTimeout: cmdTimeout, transaction: transaction)).ToList();
+
+                int insertedCount = 0;
+                int updatedCount = 0;
+
+                // 6. Process OUTPUT: only track INSERTed rows in IdMapping
+                var mappingTable = pkInfo.DataType?.ToLowerInvariant() switch
+                {
+                    "int" => "IdMappingInt",
+                    "bigint" => "IdMappingBigInt",
+                    "uniqueidentifier" => "IdMappingGuid",
+                    _ => (string?)null
+                };
+
+                if (mappingTable != null)
+                {
+                    var mappingTableEsc = mappingTable.Replace("]", "]]");
+                    var insertRows = new List<object>();
+                    foreach (var row in mergeResults)
+                    {
+                        if (string.Equals(row.MergeAction, "INSERT", StringComparison.OrdinalIgnoreCase))
+                        {
+                            insertedCount++;
+                            insertRows.Add(new { TableName = targetTableName, ColumnName = pkColumn, OldId = row.OldId, NewId = row.NewId, MigrationBatch = migrationBatch });
+                        }
+                        else if (string.Equals(row.MergeAction, "UPDATE", StringComparison.OrdinalIgnoreCase))
+                        {
+                            updatedCount++;
+                        }
+                    }
+                    if (insertRows.Count > 0)
+                    {
+                        await targetConn.ExecuteAsync(
+                            $"INSERT INTO [dbo].[{mappingTableEsc}] (TableName, ColumnName, OldId, NewId, MigrationBatch, TenantId) VALUES (@TableName, @ColumnName, @OldId, @NewId, @MigrationBatch, NULL)",
+                            insertRows, transaction: transaction, commandTimeout: cmdTimeout);
+                    }
+                }
+                else
+                {
+                    insertedCount = mergeResults.Count(r => string.Equals(r.MergeAction, "INSERT", StringComparison.OrdinalIgnoreCase));
+                    updatedCount = mergeResults.Count(r => string.Equals(r.MergeAction, "UPDATE", StringComparison.OrdinalIgnoreCase));
+                }
+
+                // 7. Drop staging table and commit
+                await DropStagingTableIfExistsAsync(targetConn, stagingName, transaction);
+                transaction.Commit();
+
+                sw.Stop();
+                TotalRowsMigrated += insertedCount;
+                Log.Information("[DataSync] Global MERGE {TargetTable} — {Inserted} inserted, {Updated} updated in {ElapsedMs}ms",
+                    targetTableName, insertedCount, updatedCount, sw.ElapsedMilliseconds);
+                ReportWriter.AddDataSyncTable(sourceTableName, targetTableName, insertedCount + updatedCount, sw.ElapsedMilliseconds, "MERGE (global)", null);
+                if (mappingTable != null && insertedCount > 0)
+                    Log.Information("   -> IdMapping: {Inserted} row(s) -> [dbo].[{MappingTable}] (TenantId = NULL)", insertedCount, mappingTable);
+            }
+            catch (Exception ex)
+            {
+                try { transaction.Rollback(); } catch { }
+                Log.Warning("[DataSync] Rolled back global MERGE {TargetTable}: {ErrorMessage}", targetTableName, ex.Message);
+                throw;
+            }
         }
 
         /// <summary>
@@ -954,7 +1395,7 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
         /// <summary>
         /// Gets target column schemas plus COLUMN_DEFAULT and IS_NULLABLE for a single table.
         /// </summary>
-        private static async Task<List<TargetColumnInfo>> GetTargetColumnsWithDefaultsAsync(SqlConnection conn, string tableName)
+        private static async Task<List<TargetColumnInfo>> GetTargetColumnsWithDefaultsAsync(SqlConnection conn, string tableName, SqlTransaction? transaction = null)
         {
             var rows = await conn.QueryAsync<(string TableName, string ColumnName, string DataType, int? CharacterMaximumLength, byte? NumericPrecision, int? NumericScale, string? DefaultValue, string IsNullable)>(@"
                 SELECT TABLE_NAME AS TableName, COLUMN_NAME AS ColumnName, DATA_TYPE AS DataType,
@@ -963,7 +1404,7 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
                     COLUMN_DEFAULT AS DefaultValue, IS_NULLABLE AS IsNullable
                 FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = @TableName
-                ORDER BY ORDINAL_POSITION", new { TableName = tableName });
+                ORDER BY ORDINAL_POSITION", new { TableName = tableName }, transaction: transaction);
             return rows.Select(r => new TargetColumnInfo
             {
                 Schema = new ColumnSchema
@@ -983,13 +1424,13 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
         /// <summary>
         /// Gets column names that are computed (is_computed = 1). These must be excluded from INSERT/MERGE.
         /// </summary>
-        private static async Task<HashSet<string>> GetComputedColumnNamesAsync(SqlConnection conn, string tableName)
+        private static async Task<HashSet<string>> GetComputedColumnNamesAsync(SqlConnection conn, string tableName, SqlTransaction? transaction = null)
         {
             var names = await conn.QueryAsync<string>(@"
                 SELECT c.name
                 FROM sys.columns c
                 WHERE c.object_id = OBJECT_ID(@TableName) AND c.is_computed = 1",
-                new { TableName = "dbo." + tableName });
+                new { TableName = "dbo." + tableName }, transaction: transaction);
             return new HashSet<string>(names ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
         }
 
@@ -1075,12 +1516,13 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
             foreach (var sc in sourceCols)
             {
                 var name = sc.ColumnName;
+                var nameEsc = name.Replace("]", "]]");
                 if (typeMismatchColNames.Contains(name) && targetColsByName.TryGetValue(name, out var tc))
-                    parts.Add($"CONVERT({GetSqlTypeString(tc)}, [{name}]) AS [{name}]");
+                    parts.Add($"CONVERT({GetSqlTypeString(tc)}, [{nameEsc}]) AS [{nameEsc}]");
                 else
-                    parts.Add($"[{name}]");
+                    parts.Add($"[{nameEsc}]");
             }
-            return "SELECT " + string.Join(", ", parts) + $" FROM [{sourceTableName}]{whereClause}";
+            return "SELECT " + string.Join(", ", parts) + $" FROM [{sourceTableName.Replace("]", "]]")}]{whereClause}";
         }
 
         /// <summary>
@@ -1090,13 +1532,20 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
         {
             if (string.IsNullOrWhiteSpace(defaultExpr)) return DBNull.Value;
             var s = defaultExpr.Trim();
-            while (s.Length > 0 && (s[0] == '(' || s[0] == ')' || s[s.Length - 1] == '(' || s[s.Length - 1] == ')'))
+            // Strip matched outer parentheses only: ((0)) -> (0) -> 0, but (getdate()) -> getdate()
+            while (s.Length >= 2 && s[0] == '(' && s[s.Length - 1] == ')')
             {
-                var prev = s;
-                s = s.TrimStart('(', ')').TrimEnd('(', ')').Trim();
-                if (s == prev) break;
+                s = s.Substring(1, s.Length - 2).Trim();
             }
             if (string.IsNullOrEmpty(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase)) return DBNull.Value;
+
+            // Handle SQL functions that produce runtime values
+            var sLower = s.ToLowerInvariant();
+            if (sLower == "getdate()" || sLower == "sysdatetime()" || sLower == "getutcdate()" || sLower == "sysutcdatetime()")
+                return DateTime.UtcNow;
+            if (sLower == "newid()" || sLower == "newsequentialid()")
+                return Guid.NewGuid();
+
             var dt = (schema.DataType ?? "").ToLowerInvariant();
             try
             {
@@ -1115,8 +1564,9 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
         /// Defensive: trim string values and truncate to column MaxLength when set (so BCP doesn't fail with "invalid column length").
         /// Only applies to string columns with MaxLength > 0; nvarchar(max) (no MaxLength) is left unchanged.
         /// </summary>
-        private static void TruncateStringRowsToColumnMaxLength(DataTable dt)
+        private static int TruncateStringRowsToColumnMaxLength(DataTable dt, string tableName)
         {
+            int truncationCount = 0;
             foreach (DataColumn col in dt.Columns)
             {
                 if (col.DataType != typeof(string) || col.MaxLength <= 0 || col.MaxLength == 2147483647) continue;
@@ -1126,11 +1576,66 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
                     if (row.IsNull(col)) continue;
                     var s = row[col] as string;
                     if (s == null) continue;
-                    s = s.Trim();
                     if (s.Length > maxLen)
-                        s = s.Substring(0, maxLen);
-                    row[col] = s;
+                    {
+                        // Only trim when truncation is actually needed — preserve whitespace otherwise
+                        s = s.Trim();
+                        if (s.Length > maxLen)
+                        {
+                            Log.Information("[Truncation] {TableName}.{ColumnName}: truncated from {SourceLength} to {MaxLength} chars", tableName, col.ColumnName, s.Length, maxLen);
+                            s = s.Substring(0, maxLen);
+                            truncationCount++;
+                        }
+                        row[col] = s;
+                    }
                 }
+            }
+            return truncationCount;
+        }
+
+        /// <summary>
+        /// Detects string values in a staging table that were truncated during SqlBulkCopy streaming.
+        /// Queries target column max lengths and checks for values at the boundary.
+        /// </summary>
+        private static async Task DetectStagingTruncationsAsync(SqlConnection targetConn, string stagingTableName, string displayTableName, SqlTransaction? transaction = null)
+        {
+            try
+            {
+                var stagingEsc = stagingTableName.Replace("]", "]]");
+                // Get variable-length string columns with max lengths from the staging table
+                // Exclude char/nchar (fixed-width) — LEN() always equals column width, causing false positives
+                var cols = await targetConn.QueryAsync<(string ColumnName, string TypeName, int MaxLength)>(
+                    @"SELECT c.name AS ColumnName, t.name AS TypeName, c.max_length AS MaxLength
+                      FROM sys.columns c
+                      INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
+                      WHERE c.object_id = OBJECT_ID(@Table)
+                        AND t.name IN ('varchar','nvarchar')
+                        AND c.max_length > 0 AND c.max_length <> -1",
+                    new { Table = $"[dbo].[{stagingEsc}]" }, transaction: transaction);
+
+                int totalTruncations = 0;
+                foreach (var col in cols)
+                {
+                    var colEsc = col.ColumnName.Replace("]", "]]");
+                    // For nvarchar, max_length is in bytes (2 per char)
+                    var charLimit = col.TypeName == "nvarchar" ? col.MaxLength / 2 : col.MaxLength;
+
+                    var count = await targetConn.ExecuteScalarAsync<int>(
+                        $"SELECT COUNT(*) FROM [dbo].[{stagingEsc}] WHERE LEN([{colEsc}]) = @MaxLen",
+                        new { MaxLen = charLimit }, transaction: transaction);
+                    if (count > 0)
+                    {
+                        Log.Information("[Truncation] {TableName}.{ColumnName}: {Count} value(s) at max length ({MaxLength} chars) — possible truncation",
+                            displayTableName, col.ColumnName, count, charLimit);
+                        totalTruncations += count;
+                    }
+                }
+                if (totalTruncations > 0)
+                    Log.Information("[Truncation] {TableName}: {Count} potential truncation(s) detected in staging", displayTableName, totalTruncations);
+            }
+            catch (Exception ex)
+            {
+                Log.Debug("[Truncation] Detection query failed for {TableName}: {Error}", displayTableName, ex.Message);
             }
         }
 
@@ -1181,7 +1686,12 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
         private static object GetDefaultForAdcOnlyColumn(string columnName, TargetColumnInfo? targetCol)
         {
             if (KnownAdcOnlyDefaults.TryGetValue(columnName, out var known))
+            {
+                // Resolve sentinel: CreationTime needs current timestamp, not class-load time
+                if (known is string s && s == "__USE_DATETIME_NOW__")
+                    return DateTime.UtcNow;
                 return known;
+            }
             if (targetCol != null && !string.IsNullOrWhiteSpace(targetCol.DefaultValue))
                 return ParseColumnDefaultToObject(targetCol.DefaultValue, targetCol.Schema);
             if (targetCol != null && !targetCol.IsNullable)
@@ -1203,6 +1713,7 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
             if (KnownAdcOnlyDefaults.TryGetValue(columnName, out var known))
             {
                 if (known == DBNull.Value) return "NULL";
+                if (known is string s && s == "__USE_DATETIME_NOW__") return "SYSDATETIME()";
                 if (known is bool b) return b ? "1" : "0";
                 if (known is int or long or decimal) return known.ToString()!;
                 if (known is DateTime) return "SYSDATETIME()";
@@ -1227,11 +1738,10 @@ SELECT @TableName, @ColumnName, OldId, NewId, @MigrationBatch, @TenantId FROM @M
         {
             if (string.IsNullOrWhiteSpace(defaultExpr)) return "NULL";
             var s = defaultExpr.Trim();
-            while (s.Length > 0 && (s[0] == '(' || s[0] == ')' || s[s.Length - 1] == '(' || s[s.Length - 1] == ')'))
+            // Strip matched outer parentheses only: ((0)) -> (0) -> 0, but (getdate()) -> getdate()
+            while (s.Length >= 2 && s[0] == '(' && s[s.Length - 1] == ')')
             {
-                var prev = s;
-                s = s.TrimStart('(', ')').TrimEnd('(', ')').Trim();
-                if (s == prev) break;
+                s = s.Substring(1, s.Length - 2).Trim();
             }
             if (string.IsNullOrEmpty(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase)) return "NULL";
             if (s.Equals("SYSDATETIME()", StringComparison.OrdinalIgnoreCase) || s.StartsWith("SYSDATETIME()", StringComparison.OrdinalIgnoreCase)) return "SYSDATETIME()";

@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using Serilog;
 
 namespace Logistics.DbMerger
 {
@@ -86,7 +87,7 @@ IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'IdMappingGuid' AND schema_id =
             cmd2.CommandTimeout = 60;
             await cmd2.ExecuteNonQueryAsync();
 
-            Console.WriteLine("[IdMapping] IdMappingInt, IdMappingBigInt, IdMappingGuid tables ensured.");
+            Log.Information("[IdMapping] IdMappingInt, IdMappingBigInt, IdMappingGuid tables ensured.");
         }
     }
 }

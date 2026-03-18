@@ -4,6 +4,34 @@ namespace Logistics.DbMerger
 {
     public static class MigrationConfig
     {
+        /// <summary>
+        /// Sentinel tenant ID used in DataSyncCheckpoint for global tables (no real tenant).
+        /// Value 0 is safe because tenant IDs start from 1.
+        /// </summary>
+        public const int GlobalTableCheckpointSentinel = 0;
+
+        /// <summary>
+        /// Global tables (no TenantId) that need MERGE upsert instead of insert-only.
+        /// Excludes Tenants (skipped via ABP strategy).
+        /// </summary>
+        public static readonly HashSet<string> GlobalTables = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Editions",
+            "AllowableAbsence",
+            "SubThreadType"
+        };
+
+        /// <summary>
+        /// MERGE match key column for each global table.
+        /// GUID PK tables match on PK directly; identity PK tables (Editions) match on a business column.
+        /// </summary>
+        public static readonly Dictionary<string, string> GlobalTableNaturalKeys = new(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Editions", "Name" },
+            { "AllowableAbsence", "AllowableAbsenceID" },
+            { "SubThreadType", "SubThreadTypeID" }
+        };
+
         // Define the explicit order of tables for migration (Tiers 1-8)
         public static readonly List<string> TableOrder = new List<string>
         {
@@ -33,6 +61,10 @@ namespace Logistics.DbMerger
             "PublicHolidayGroupDay",
             "RDOGroup",
             "RDOGroupDetail",
+            "Category",
+            "ProvidedToType",
+            "RoleType",
+            "AllowableAbsence",
 
             // 4.2 Tier 2 - Core Entity Tables
             "Grade",
@@ -58,10 +90,13 @@ namespace Logistics.DbMerger
             "DayDefinition",
             "CommentTemplate",
             "DoomDashboardTemplate",
+            "Agency",
+            "TenantTimeZone",
 
             // 4.3 Tier 3 - Primary Operational Tables
             "Contact",
             "ContactRDOGroup",
+            "AgencyContact",
             "Users",
             "UserAccounts",
             "UserRoles",
@@ -98,6 +133,9 @@ namespace Logistics.DbMerger
             "CommercialShift",
             "CommercialVolume",
             "LoadManagementCalc",
+            "AgencyInvoice",
+            "ActualActivityConfiguration",
+            "OffTaskMinutesByTask",
 
             // 4.5 Tier 5 - High-Volume Operational Tables
             "TimebandHeader",
@@ -115,10 +153,13 @@ namespace Logistics.DbMerger
             "IndirectClockEvents", // MDC Name (Explicitly mapped, but listed for completeness)
             "ClockingTransactionSyncTempDatas",
             "ClockIntegrationSyncJobHistories",
+            "IndirectClockingTransactionSyncTempDatas",
+            "KronosEmployeeTemps",
             "VolumeBlockData",
             "VolumeDetail",
             "VolumeDetailAudit",
             "VolumeDetailMaster",
+            "VolumeTaskConversion",
             "BulkVolumeDetail",
 
             // 4.6 Tier 6 - Secondary/Support Tables
@@ -160,6 +201,10 @@ namespace Logistics.DbMerger
             "BackgroundJobs",
 
             // 4.8 Tier 8 - Notifications & Settings
+            "LanguageTexts",
+            "AppBinaryObjects",
+            "AppChatMessages",
+            "AppFriendships",
             "Setting",
             "Settings",
             "IntegrationSettings",
@@ -182,7 +227,10 @@ namespace Logistics.DbMerger
             "AbsenteeismRate",
             "TeamMemberPerformance",
             "WrongFunctionLog",
-            "WrongFunctionTaskControl"
+            "WrongFunctionTaskControl",
+            "Numbers",
+            "bulkreconcillation",
+            "volumes"
         };
 
         /// <summary>
@@ -219,6 +267,10 @@ namespace Logistics.DbMerger
                     "PublicHolidayGroupDay",
                     "RDOGroup",
                     "RDOGroupDetail",
+                    "Category",
+                    "ProvidedToType",
+                    "RoleType",
+                    "AllowableAbsence",
                 }
             },
             {
@@ -247,6 +299,8 @@ namespace Logistics.DbMerger
                     "DayDefinition",
                     "CommentTemplate",
                     "DoomDashboardTemplate",
+                    "Agency",
+                    "TenantTimeZone",
                 }
             },
             {
@@ -254,6 +308,7 @@ namespace Logistics.DbMerger
                 {
                     "Contact",
                     "ContactRDOGroup",
+                    "AgencyContact",
                     "Users",
                     "UserAccounts",
                     "UserRoles",
@@ -293,6 +348,9 @@ namespace Logistics.DbMerger
                     "CommercialShift",
                     "CommercialVolume",
                     "LoadManagementCalc",
+                    "AgencyInvoice",
+                    "ActualActivityConfiguration",
+                    "OffTaskMinutesByTask",
                 }
             },
             {
@@ -313,10 +371,13 @@ namespace Logistics.DbMerger
                     "IndirectClockEvents",
                     "ClockingTransactionSyncTempDatas",
                     "ClockIntegrationSyncJobHistories",
+                    "IndirectClockingTransactionSyncTempDatas",
+                    "KronosEmployeeTemps",
                     "VolumeBlockData",
                     "VolumeDetail",
                     "VolumeDetailAudit",
                     "VolumeDetailMaster",
+                    "VolumeTaskConversion",
                     "BulkVolumeDetail",
                 }
             },
@@ -367,6 +428,10 @@ namespace Logistics.DbMerger
             {
                 8, new List<string>
                 {
+                    "LanguageTexts",
+                    "AppBinaryObjects",
+                    "AppChatMessages",
+                    "AppFriendships",
                     "Setting",
                     "Settings",
                     "IntegrationSettings",
@@ -390,6 +455,9 @@ namespace Logistics.DbMerger
                     "TeamMemberPerformance",
                     "WrongFunctionLog",
                     "WrongFunctionTaskControl",
+                    "Numbers",
+                    "bulkreconcillation",
+                    "volumes",
                 }
             },
         };

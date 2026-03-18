@@ -41,6 +41,9 @@ END
             int targetTenantId,
             string tableName)
         {
+            if (targetConn.State != System.Data.ConnectionState.Open)
+                await targetConn.OpenAsync();
+
             const string sql = @"
 SELECT COUNT(1)
 FROM [dbo].[DataSyncCheckpoint]
@@ -63,8 +66,11 @@ WHERE [SourceTenantId] = @SourceTenantId
             int targetTenantId,
             string tableName)
         {
+            if (targetConn.State != System.Data.ConnectionState.Open)
+                await targetConn.OpenAsync();
+
             const string sql = @"
-MERGE [dbo].[DataSyncCheckpoint] AS target
+MERGE [dbo].[DataSyncCheckpoint] WITH (HOLDLOCK) AS target
 USING (VALUES (@SourceTenantId, @TargetTenantId, @TableName)) AS src(SourceTenantId, TargetTenantId, TableName)
    ON target.SourceTenantId = src.SourceTenantId
   AND target.TargetTenantId = src.TargetTenantId
@@ -83,7 +89,7 @@ WHEN NOT MATCHED THEN
         }
 
         /// <summary>
-        /// Clears all checkpoint rows. Used by Option 8 when clearing migration data to keep data and checkpoints consistent.
+        /// Clears all checkpoint rows. Used by Option 8 when clearing ALL migration data.
         /// </summary>
         public static async Task ClearAllAsync(SqlConnection targetConn)
         {
@@ -95,6 +101,25 @@ IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'DataSyncCheckpoint' AND schema
     TRUNCATE TABLE [dbo].[DataSyncCheckpoint];";
 
             using var cmd = new SqlCommand(sql, targetConn);
+            cmd.CommandTimeout = 60;
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        /// <summary>
+        /// Clears checkpoint rows for a specific tenant only. Preserves other tenants' checkpoints.
+        /// </summary>
+        public static async Task ClearByTenantAsync(SqlConnection targetConn, int tenantId)
+        {
+            if (targetConn.State != System.Data.ConnectionState.Open)
+                await targetConn.OpenAsync();
+
+            var sql = @"
+IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'DataSyncCheckpoint' AND schema_id = SCHEMA_ID('dbo'))
+    DELETE FROM [dbo].[DataSyncCheckpoint]
+    WHERE [SourceTenantId] = @TenantId OR [TargetTenantId] = @TenantId;";
+
+            using var cmd = new SqlCommand(sql, targetConn);
+            cmd.Parameters.AddWithValue("@TenantId", tenantId);
             cmd.CommandTimeout = 60;
             await cmd.ExecuteNonQueryAsync();
         }

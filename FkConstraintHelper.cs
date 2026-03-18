@@ -1,5 +1,6 @@
 using Microsoft.Data.SqlClient;
 using Dapper;
+using Serilog;
 
 namespace Logistics.DbMerger
 {
@@ -28,6 +29,8 @@ namespace Logistics.DbMerger
         /// </summary>
         public static async Task DisableAllFkAsync(SqlConnection conn)
         {
+            LastDisabledCount = 0;
+            LastEnabledCount = 0;
             if (conn.State != System.Data.ConnectionState.Open)
                 await conn.OpenAsync();
 
@@ -42,6 +45,9 @@ namespace Logistics.DbMerger
                 ORDER BY OBJECT_NAME(fk.parent_object_id), fk.name")).ToList();
 
             // Cache original FK states so we can restore disabled / NOCHECK flags later.
+            if (_originalFkStates != null && _originalFkStates.Count > 0)
+                Log.Warning("[FK] Warning: DisableAllFkAsync called while FK states already cached ({Count} entries). Previous state will be overwritten.", _originalFkStates.Count);
+
             _originalFkStates = fks.Select(f => new FkState
             {
                 SchemaName = f.SchemaName,
@@ -51,12 +57,30 @@ namespace Logistics.DbMerger
                 WasNotTrusted = f.IsNotTrusted
             }).ToList();
 
-            var statements = fks.Select(f => $"ALTER TABLE [{f.SchemaName}].[{f.TableName}] NOCHECK CONSTRAINT [{f.FkName}]");
-            var script = string.Join("; ", statements);
-            if (!string.IsNullOrEmpty(script))
-                await conn.ExecuteAsync(script, commandTimeout: 300);
-            Console.WriteLine($"[FK] Disabled {fks.Count()} foreign key constraint(s).");
+            int disabled = 0;
+            foreach (var f in fks)
+            {
+                var schemaEsc = f.SchemaName.Replace("]", "]]");
+                var tableEsc = f.TableName.Replace("]", "]]");
+                var fkEsc = f.FkName.Replace("]", "]]");
+                try
+                {
+                    await conn.ExecuteAsync($"ALTER TABLE [{schemaEsc}].[{tableEsc}] NOCHECK CONSTRAINT [{fkEsc}]", commandTimeout: 60);
+                    disabled++;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[FK] Could not disable [{TableName}].[{FkName}]: {ErrorMessage}", f.TableName, f.FkName, ex.Message);
+                }
+            }
+            Log.Information("[FK] Disabled {Count} foreign key constraint(s).", disabled);
+            LastDisabledCount = disabled;
         }
+
+        /// <summary>Count of FKs disabled in the most recent DisableAllFkAsync call.</summary>
+        public static int LastDisabledCount { get; private set; }
+        /// <summary>Count of FKs enabled/restored in the most recent EnableAllFkAsync call.</summary>
+        public static int LastEnabledCount { get; private set; }
 
         /// <summary>
         /// Enables all foreign key constraints in the database (schema dbo).
@@ -85,17 +109,18 @@ namespace Logistics.DbMerger
 
                 foreach (var (schemaName, tableName, fkName) in fks)
                 {
-                    var sql = $"ALTER TABLE [{schemaName}].[{tableName}] WITH CHECK CHECK CONSTRAINT [{fkName}]";
+                    var sql = $"ALTER TABLE [{schemaName.Replace("]", "]]")}].[{tableName.Replace("]", "]]")}] WITH CHECK CHECK CONSTRAINT [{fkName.Replace("]", "]]")}]";
                     try
                     {
                         await conn.ExecuteAsync(sql);
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[FK] Warning: Could not enable [{tableName}].[{fkName}]: {ex.Message}");
+                        Log.Error("[FK] Warning: Could not enable [{TableName}].[{FkName}]: {ErrorMessage}", tableName, fkName, ex.Message);
                     }
                 }
-                Console.WriteLine($"[FK] Enabled {fks.Count()} foreign key constraint(s).");
+                Log.Information("[FK] Enabled {Count} foreign key constraint(s).", fks.Count());
+                LastEnabledCount = fks.Count();
                 return;
             }
 
@@ -106,15 +131,18 @@ namespace Logistics.DbMerger
                     continue;
 
                 string sql;
+                var sEsc = fk.SchemaName.Replace("]", "]]");
+                var tEsc = fk.TableName.Replace("]", "]]");
+                var fEsc = fk.FkName.Replace("]", "]]");
                 if (!fk.WasNotTrusted)
                 {
                     // Trusted FK: validate existing data.
-                    sql = $"ALTER TABLE [{fk.SchemaName}].[{fk.TableName}] WITH CHECK CHECK CONSTRAINT [{fk.FkName}]";
+                    sql = $"ALTER TABLE [{sEsc}].[{tEsc}] WITH CHECK CHECK CONSTRAINT [{fEsc}]";
                 }
                 else
                 {
                     // Untrusted / NOCHECK FK: enable without validating existing data.
-                    sql = $"ALTER TABLE [{fk.SchemaName}].[{fk.TableName}] CHECK CONSTRAINT [{fk.FkName}]";
+                    sql = $"ALTER TABLE [{sEsc}].[{tEsc}] CHECK CONSTRAINT [{fEsc}]";
                 }
 
                 try
@@ -123,16 +151,19 @@ namespace Logistics.DbMerger
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[FK] Warning: Could not enable [{fk.TableName}].[{fk.FkName}]: {ex.Message}");
+                    Log.Error("[FK] Warning: Could not enable [{TableName}].[{FkName}]: {ErrorMessage}", fk.TableName, fk.FkName, ex.Message);
                 }
             }
-            Console.WriteLine($"[FK] Restored {states.Count} foreign key constraint(s) to original enabled/NOCHECK state.");
+            Log.Information("[FK] Restored {Count} foreign key constraint(s) to original enabled/NOCHECK state.", states.Count);
+            LastEnabledCount = states.Count;
+            _originalFkStates = null; // Clear stale state to prevent re-application on subsequent runs
         }
 
         /// <summary>
         /// Updates child table FK columns from IdMapping (Int/BigInt/Guid) for the given migration batch.
+        /// Scopes updates to the target tenant's rows to prevent cross-tenant data corruption.
         /// </summary>
-        public static async Task UpdateFkFromIdMappingAsync(SqlConnection targetConn, string migrationBatch, int? tenantId)
+        public static async Task UpdateFkFromIdMappingAsync(SqlConnection targetConn, string migrationBatch, int? tenantId, int? targetTenantId)
         {
             if (targetConn.State != System.Data.ConnectionState.Open)
                 await targetConn.OpenAsync();
@@ -169,9 +200,24 @@ namespace Logistics.DbMerger
             foreach (var row in columnTypes)
                 columnTypeMap[$"{row.TableName}|{row.ColumnName}"] = row.DataType;
 
+            // Task 1: Build a cache of which child tables have a TenantId column
+            var tablesWithTenantId = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var tenantIdCheck = (await targetConn.QueryAsync<string>(@"
+                SELECT DISTINCT OBJECT_NAME(c.object_id)
+                FROM sys.columns c
+                WHERE c.name = 'TenantId'
+                  AND OBJECT_SCHEMA_NAME(c.object_id) = 'dbo'
+                  AND OBJECTPROPERTY(c.object_id, 'IsUserTable') = 1")).ToList();
+            foreach (var t in tenantIdCheck)
+                tablesWithTenantId.Add(t);
+
             foreach (var fk in fkList)
             {
-                if (!pkCache.TryGetValue(fk.ChildTable, out var pkInfo) || pkInfo == null) continue;
+                if (!pkCache.TryGetValue(fk.ChildTable, out var pkInfo) || pkInfo == null)
+                {
+                    Log.Warning("[FK] Skipping FK remapping for {ChildTable}.{ChildColumn} -> {ReferencedTable}.{ReferencedColumn}: child table has no PK info", fk.ChildTable, fk.ChildColumn, fk.ReferencedTable, fk.ReferencedColumn);
+                    continue;
+                }
                 if (pkInfo.PkColumnCount > 1)
                     continue; // Child has composite PK: already inserted with NewId, no need to update FK
 
@@ -189,13 +235,33 @@ namespace Logistics.DbMerger
 
                 if (mappingTable == null)
                 {
-                    Console.WriteLine($"[FK] Skip update {fk.ChildTable}.{fk.ChildColumn} (type {dataType} not mapped).");
+                    Log.Information("[FK] Skip update {ChildTable}.{ChildColumn} (type {DataType} not mapped).", fk.ChildTable, fk.ChildColumn, dataType);
                     continue;
                 }
 
+                // IdMapping tenant filter (scopes which mapping rows to use)
+                // Include TenantId IS NULL to also match global table mappings (Editions, AllowableAbsence, SubThreadType)
                 string tenantFilter = tenantId.HasValue
-                    ? " AND m.TenantId = @TenantId"
+                    ? " AND (m.TenantId = @TenantId OR m.TenantId IS NULL)"
                     : " AND m.TenantId IS NULL";
+
+                // Task 2: Child table tenant filter (prevents cross-tenant data corruption)
+                bool childHasTenantId = tablesWithTenantId.Contains(fk.ChildTable);
+                string childTenantFilter = "";
+                if (childHasTenantId)
+                {
+                    if (targetTenantId.HasValue)
+                    {
+                        childTenantFilter = " AND c.TenantId = @TargetTenantId";
+                    }
+                    else
+                    {
+                        // Global migration (no specific tenant): only update host-level rows (TenantId IS NULL)
+                        // to prevent accidentally modifying all tenants' data
+                        childTenantFilter = " AND c.TenantId IS NULL";
+                        Log.Warning("[FK] Child table {ChildTable} has TenantId but targetTenantId is NULL — restricting to host rows only", fk.ChildTable);
+                    }
+                }
 
                 var childColEsc = fk.ChildColumn.Replace("]", "]]");
                 var childTableEsc = fk.ChildTable.Replace("]", "]]");
@@ -207,29 +273,23 @@ namespace Logistics.DbMerger
                         AND m.ColumnName = @ReferencedColumn
                         AND c.[{childColEsc}] = m.OldId
                     WHERE m.MigrationBatch = @MigrationBatch
-                    {tenantFilter}";
+                    {tenantFilter}
+                    {childTenantFilter}";
 
                 var affected = await targetConn.ExecuteAsync(updateSql, new
                 {
                     ReferencedTable = fk.ReferencedTable,
                     ReferencedColumn = fk.ReferencedColumn,
                     MigrationBatch = migrationBatch,
-                    TenantId = tenantId
+                    TenantId = tenantId,
+                    TargetTenantId = targetTenantId
                 }, commandTimeout: 600);
                 if (affected > 0)
-                    Console.WriteLine($"[FK] Updated {fk.ChildTable}.{fk.ChildColumn} -> {fk.ReferencedTable}.{fk.ReferencedColumn}: {affected} row(s).");
+                {
+                    Log.Information("[FK] Updated {ChildTable}.{ChildColumn} -> {ReferencedTable}.{ReferencedColumn}: {Affected} row(s).", fk.ChildTable, fk.ChildColumn, fk.ReferencedTable, fk.ReferencedColumn, affected);
+                    ReportWriter.AddFkUpdate(fk.ChildTable, fk.ChildColumn, fk.ReferencedTable, fk.ReferencedColumn, affected);
+                }
             }
-        }
-
-        private static async Task<string?> GetColumnDataTypeAsync(SqlConnection conn, string tableName, string columnName)
-        {
-            var dataType = await conn.QueryFirstOrDefaultAsync<string>(@"
-                SELECT t.name AS DataType
-                FROM sys.columns c
-                INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
-                WHERE c.object_id = OBJECT_ID(@TableName) AND c.name = @ColumnName",
-                new { TableName = "dbo." + tableName, ColumnName = columnName });
-            return dataType;
         }
 
         private class FkRow
