@@ -297,6 +297,17 @@ namespace Logistics.DbMerger
                     {
                         targetTenantId = existingTargetId;
                         Log.Information("[TenantMap] Found existing Target Tenant '{TenantName}' (ID: {TargetTenantId}). Merging into it.", tenantName, targetTenantId);
+
+                        // Safety check: warn if previous migration data exists (could cause duplicates)
+                        var hasPriorMapping = await target.ExecuteScalarAsync<int>(
+                            "SELECT CASE WHEN EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'IdMappingGuid') " +
+                            "AND EXISTS (SELECT 1 FROM IdMappingGuid WHERE TenantId = @TenantId) THEN 1 ELSE 0 END",
+                            new { TenantId = targetTenantId });
+                        if (hasPriorMapping > 0)
+                        {
+                            Log.Warning("[Warning] IdMapping data already exists for Target TenantId {TargetTenantId}. Re-importing without clearing may cause duplicate rows.", targetTenantId);
+                            Log.Warning("[Warning] Consider running Option 10 (Clear Migration Data) first.");
+                        }
                     }
                     else
                     {
@@ -450,6 +461,9 @@ namespace Logistics.DbMerger
                 await IdMappingSetup.CreateIdMappingTablesIfNotExistsAsync(targetConnection);
                 await DataSyncCheckpointHelper.EnsureTableAsync(targetConnection);
                 await FkConstraintHelper.DisableAllFkAsync(targetConnection);
+                // Clear global table checkpoint so global tables (Editions, AllowableAbsence, SubThreadType)
+                // are always re-merged with latest source data on each run
+                await DataSyncCheckpointHelper.ClearByTenantAsync(targetConnection, MigrationConfig.GlobalTableCheckpointSentinel);
                 // When running ALL tenants, clear completed-tenant file so single-tenant tracking stays separate
                 if (allTenantPairs != null)
                 {
@@ -879,7 +893,7 @@ namespace Logistics.DbMerger
         /// </summary>
         static async Task RunClearMigrationDataAsync(string targetConnStr)
         {
-            Log.Information("\n--> [Option 8] Clear migration data (delete rows in ADC based on IdMapping)");
+            Log.Information("\n--> [Option 10] Clear migration data (delete rows in ADC based on IdMapping)");
             Console.Write("[Optional] MigrationBatch (Enter = all batches, or paste batch ID): ");
             var batchInput = Console.ReadLine()?.Trim();
             Console.Write("[Optional] TenantId (Enter = all tenants, or number): ");
@@ -895,45 +909,85 @@ namespace Logistics.DbMerger
 
             string? filterBatch = string.IsNullOrEmpty(batchInput) ? null : batchInput;
             var totalDeleted = 0;
+            int errors = 0;
 
-            totalDeleted = await ProcessIdMappingTableAsync(conn, "IdMappingInt", filterBatch, filterTenantId);
-            totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingBigInt", filterBatch, filterTenantId);
-            totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingGuid", filterBatch, filterTenantId);
-
-            // When clearing a specific tenant, also clear global table rows (TenantId IS NULL in IdMapping)
-            if (filterTenantId.HasValue)
+            try
             {
-                Log.Warning("[Clear] Also clearing global/shared table rows (TenantId IS NULL in IdMapping). These will be re-imported on next migration run.");
-                totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingInt", filterBatch, filterTenantId: null, globalRowsOnly: true);
-                totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingBigInt", filterBatch, filterTenantId: null, globalRowsOnly: true);
-                totalDeleted += await ProcessIdMappingTableAsync(conn, "IdMappingGuid", filterBatch, filterTenantId: null, globalRowsOnly: true);
+                // Process each IdMapping table — errors per table are caught and logged, not thrown
+                foreach (var mappingTable in new[] { "IdMappingInt", "IdMappingBigInt", "IdMappingGuid" })
+                {
+                    try
+                    {
+                        totalDeleted += await ProcessIdMappingTableAsync(conn, mappingTable, filterBatch, filterTenantId);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("[Clear] Error processing {MappingTable}: {ErrorMessage}. Continuing with next...", mappingTable, ex.Message);
+                        errors++;
+                    }
+                }
+
+                // When clearing a specific tenant, also clear global table rows (TenantId IS NULL in IdMapping)
+                if (filterTenantId.HasValue)
+                {
+                    Log.Warning("[Clear] Also clearing global/shared table rows (TenantId IS NULL in IdMapping). These will be re-imported on next migration run.");
+                    foreach (var mappingTable in new[] { "IdMappingInt", "IdMappingBigInt", "IdMappingGuid" })
+                    {
+                        try
+                        {
+                            totalDeleted += await ProcessIdMappingTableAsync(conn, mappingTable, filterBatch, filterTenantId: null, globalRowsOnly: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error("[Clear] Error processing global rows in {MappingTable}: {ErrorMessage}. Continuing...", mappingTable, ex.Message);
+                            errors++;
+                        }
+                    }
+                }
             }
-
-            await FkConstraintHelper.EnableAllFkAsync(conn);
-            Log.Information("\n[Option 8] Done. Total rows deleted from data tables: {TotalDeleted}.", totalDeleted);
-
-            // Clear DataSync checkpoints — per-tenant if filtering, all if not
-            if (filterTenantId.HasValue)
+            finally
             {
-                await DataSyncCheckpointHelper.ClearByTenantAsync(conn, filterTenantId.Value);
-                // Also clear global table checkpoints (sentinel 0,0)
-                await DataSyncCheckpointHelper.ClearByTenantAsync(conn, MigrationConfig.GlobalTableCheckpointSentinel);
-                Log.Information("[Option 8] Cleared DataSyncCheckpoint for TenantId {TenantId} and global tables.", filterTenantId.Value);
-            }
-            else
-            {
-                await DataSyncCheckpointHelper.ClearAllAsync(conn);
-                Log.Information("[Option 8] Cleared all DataSyncCheckpoint rows.");
+                // Always re-enable FKs and clear checkpoints, even if errors occurred
+                try
+                {
+                    await FkConstraintHelper.EnableAllFkAsync(conn);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[Clear] Error re-enabling FKs: {ErrorMessage}", ex.Message);
+                }
+
+                Log.Information("\n[Option 10] Done. Total rows deleted: {TotalDeleted}. Errors: {ErrorCount}.", totalDeleted, errors);
+
+                // Clear DataSync checkpoints — per-tenant if filtering, all if not
+                try
+                {
+                    if (filterTenantId.HasValue)
+                    {
+                        await DataSyncCheckpointHelper.ClearByTenantAsync(conn, filterTenantId.Value);
+                        await DataSyncCheckpointHelper.ClearByTenantAsync(conn, MigrationConfig.GlobalTableCheckpointSentinel);
+                        Log.Information("[Option 10] Cleared DataSyncCheckpoint for TenantId {TenantId} and global tables.", filterTenantId.Value);
+                    }
+                    else
+                    {
+                        await DataSyncCheckpointHelper.ClearAllAsync(conn);
+                        Log.Information("[Option 10] Cleared all DataSyncCheckpoint rows.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[Clear] Error clearing checkpoints: {ErrorMessage}", ex.Message);
+                }
             }
         }
 
         static async Task RunEnableFkAsync(string targetConnStr)
         {
-            Log.Information("\n--> [Option 10] Enable FK (re-enable all foreign keys on target)");
+            Log.Information("\n--> [Option 7] Enable FK (re-enable all foreign keys on target)");
             using var conn = new SqlConnection(targetConnStr);
             await conn.OpenAsync();
             await FkConstraintHelper.EnableAllFkAsync(conn);
-            Log.Information("[Option 10] Done. All foreign keys on target have been re-enabled.");
+            Log.Information("[Option 7] Done. All foreign keys on target have been re-enabled.");
         }
 
         /// <summary>
@@ -979,11 +1033,14 @@ namespace Logistics.DbMerger
                 {
                     deleted = await conn.ExecuteAsync(deleteDataSql, prm, commandTimeout: Option8CommandTimeoutSeconds);
                     tableDeleted += deleted;
+                    // Log progress for large tables (every 500K rows)
+                    if (tableDeleted > 0 && tableDeleted % 500000 < deleteBatchSize)
+                        Log.Information("  [{TableName}] {Deleted:N0} rows deleted so far...", tableName, tableDeleted);
                 } while (deleted == deleteBatchSize);
 
                 if (tableDeleted > 0)
                 {
-                    Log.Information("  Deleted {DeletedCount} row(s) from [dbo].[{TableName}]{GlobalTag}", tableDeleted, tableName, globalRowsOnly ? " (global)" : "");
+                    Log.Information("  Deleted {DeletedCount:N0} row(s) from [dbo].[{TableName}]{GlobalTag}", tableDeleted, tableName, globalRowsOnly ? " (global)" : "");
                     totalDeleted += tableDeleted;
                 }
 
@@ -1006,8 +1063,15 @@ namespace Logistics.DbMerger
                 sql += " AND TenantId IS NULL";
             else if (filterTenantId.HasValue)
                 sql += " AND TenantId = @TenantId";
-            var rows = await conn.QueryAsync<(string TableName, string ColumnName)>(sql, new { Batch = filterBatch, TenantId = filterTenantId });
-            return rows.ToList();
+            var rows = await conn.QueryAsync<(string TableName, string ColumnName)>(sql, new { Batch = filterBatch, TenantId = filterTenantId },
+                commandTimeout: Option8CommandTimeoutSeconds);
+
+            // Order by reverse MigrationConfig tier order (delete children before parents)
+            var reverseOrder = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var tierTables = MigrationConfig.TableOrder;
+            for (int i = 0; i < tierTables.Count; i++)
+                reverseOrder[tierTables[i]] = tierTables.Count - i; // higher = delete first
+            return rows.OrderByDescending(r => reverseOrder.TryGetValue(r.TableName, out var order) ? order : 0).ToList();
         }
 
         // Define Explicit Mappings (Source -> Target)
@@ -1165,6 +1229,19 @@ namespace Logistics.DbMerger
         {
              // Initialize report folder for this run
              ReportWriter.Initialize(tenantName ?? "ALL", DateTime.UtcNow);
+
+             // Resolve tenant IDs early so reports show correct values
+             if (!string.IsNullOrEmpty(tenantName))
+             {
+                 using var srcConn = new SqlConnection(sourceConn);
+                 using var tgtConn = new SqlConnection(targetConn);
+                 var srcId = await srcConn.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE TenancyName = @Name", new { Name = tenantName })
+                          ?? await srcConn.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE Name = @Name", new { Name = tenantName });
+                 var tgtId = await tgtConn.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE TenancyName = @Name", new { Name = tenantName })
+                          ?? await tgtConn.QueryFirstOrDefaultAsync<int?>("SELECT Id FROM Tenants WHERE Name = @Name", new { Name = tenantName });
+                 if (srcId.HasValue)
+                     ReportWriter.SetDataSyncTenantInfo(srcId.Value, tgtId ?? 0, tenantName);
+             }
 
              // Inject tenant name into Console.In so RunDataSync/RunValidation can read it non-interactively
              // Each method calls Console.ReadLine() for tenant name — feed it the value (or empty for ALL)
